@@ -1,0 +1,82 @@
+{
+  "name": "dbbbb",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A calm, local-first database browser for PostgreSQL, MongoDB, MySQL, and SQLite.",
+  "author": "dbbbb contributors",
+  "license": "MIT",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "npm run typecheck && electron-vite build",
+    "package:dir": "npm run build && electron-builder --dir",
+    "package:mac": "npm run build && electron-builder --mac",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run",
+    "test:integration": "npm run test:integration:postgres && npm run test:integration:mongo && npm run test:integration:mysql",
+    "test:integration:mongo": "vitest run --config vitest.mongo-integration.config.ts",
+    "test:integration:mysql": "vitest run --config vitest.mysql-integration.config.ts",
+    "test:integration:postgres": "vitest run --config vitest.integration.config.ts",
+    "test:watch": "vitest"
+  },
+  "build": {
+    "appId": "io.dbbbb.desktop",
+    "productName": "dbbbb",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json",
+      "LICENSE"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.png",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "category": "Development",
+      "icon": "build/icon.png",
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    }
+  },
+  "dependencies": {
+    "lucide-react": "1.38.0",
+    "mongodb": "7.6.0",
+    "mysql2": "3.24.2",
+    "pg": "8.23.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "^24.0.0",
+    "@types/pg": "8.23.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "5.2.0",
+    "electron": "^44.1.0",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "jsdom": "^30.0.0",
+    "typescript": "7.0.2",
+    "vite": "7.3.6",
+    "vitest": "4.1.11"
+  }
+}
