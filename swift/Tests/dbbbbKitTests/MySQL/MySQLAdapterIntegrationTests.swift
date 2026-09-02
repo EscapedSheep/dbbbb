@@ -158,7 +158,6 @@ final class MySQLAdapterIntegrationTests: XCTestCase {
         return (columns, rows)
     }
 
-    /// Builds the `original` record of a change from one previewed row.
     private func originalRecord(columns: [ColumnMeta], row: [DisplayValue]) -> [String: DisplayValue] {
         Dictionary(zip(columns, row).map { ($0.0.name, $0.1) }) { first, _ in first }
     }

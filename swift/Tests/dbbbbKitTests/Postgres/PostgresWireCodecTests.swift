@@ -45,7 +45,6 @@ final class PostgresWireCodecTests: XCTestCase {
         XCTAssertEqual(
             decode(.numeric, numeric(ndigits: 3, weight: 1, sign: 0, dscale: 3, digits: [1, 2345, 6780])),
             .string("12345.678"))
-        // -0.0001
         XCTAssertEqual(
             decode(.numeric, numeric(ndigits: 1, weight: -1, sign: 0x4000, dscale: 4, digits: [1])),
             .string("-0.0001"))
@@ -57,7 +56,6 @@ final class PostgresWireCodecTests: XCTestCase {
         XCTAssertEqual(
             decode(.numeric, numeric(ndigits: 1, weight: 1, sign: 0, dscale: 0, digits: [1])),
             .string("10000"))
-        // 0.5
         XCTAssertEqual(
             decode(.numeric, numeric(ndigits: 1, weight: -1, sign: 0, dscale: 1, digits: [5000])),
             .string("0.5"))
@@ -65,7 +63,6 @@ final class PostgresWireCodecTests: XCTestCase {
         XCTAssertEqual(
             decode(.numeric, numeric(ndigits: 1, weight: -2, sign: 0, dscale: 5, digits: [1000])),
             .string("0.00001"))
-        // zero
         XCTAssertEqual(
             decode(.numeric, numeric(ndigits: 0, weight: 0, sign: 0, dscale: 0, digits: [])),
             .string("0"))

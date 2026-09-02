@@ -5,7 +5,6 @@ import Testing
 
 struct MongoDisplayValueTests {
     @Test func taggedWireShapes() {
-        // ObjectId → {"$oid": hex}
         #expect(
             MongoDisplayValue.convert(.objectID(Data(repeating: 0xAB, count: 12)))
                 == .object([("$oid", .string("abababababababababababab"))])
@@ -15,12 +14,10 @@ struct MongoDisplayValueTests {
             MongoDisplayValue.convert(.int64(9_007_199_254_740_993))
                 == .object([("$numberLong", .string("9007199254740993"))])
         )
-        // Decimal128 → {"$numberDecimal": string}
         #expect(
             MongoDisplayValue.convert(.decimal128(low: 1, high: 0x303E_0000_0000_0000))
                 == .object([("$numberDecimal", .string("0.1"))])
         )
-        // Binary → {"$binary": {"base64": …, "subType": …}}
         #expect(
             MongoDisplayValue.convert(.binary(subtype: 0x80, data: Data([1, 2, 3])))
                 == .object([("$binary", .object([("base64", .string("AQID")), ("subType", .string("80"))]))])

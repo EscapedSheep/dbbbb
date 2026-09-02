@@ -136,7 +136,6 @@ struct NewConnectionView: View {
                 problems.append("Host is required.")
             }
             if let portNumber = Int(port), (1...65535).contains(portNumber) {
-                // valid
             } else {
                 problems.append("Port must be a number between 1 and 65535.")
             }

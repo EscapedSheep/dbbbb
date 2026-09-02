@@ -106,7 +106,7 @@ struct JSONParser {
     }
 
     private mutating func parseObject() throws -> JSONValue {
-        offset += 1 // {
+        offset += 1
         var pairs: [(key: String, value: JSONValue)] = []
         skipWhitespace()
         if peek() == UInt8(ascii: "}") {
@@ -135,7 +135,7 @@ struct JSONParser {
     }
 
     private mutating func parseArray() throws -> JSONValue {
-        offset += 1 // [
+        offset += 1
         var values: [JSONValue] = []
         skipWhitespace()
         if peek() == UInt8(ascii: "]") {
@@ -157,7 +157,7 @@ struct JSONParser {
     }
 
     private mutating func parseString() throws -> String {
-        offset += 1 // opening quote
+        offset += 1
         var scalars = String.UnicodeScalarView()
         while true {
             guard offset < bytes.count else { throw EJSONError.invalidJSON }
@@ -206,7 +206,6 @@ struct JSONParser {
             case 0x00...0x1F:
                 throw EJSONError.invalidJSON
             default:
-                // Copy one full UTF-8 sequence verbatim.
                 let length: Int
                 if byte < 0x80 { length = 1 }
                 else if byte < 0xE0 { length = 2 }

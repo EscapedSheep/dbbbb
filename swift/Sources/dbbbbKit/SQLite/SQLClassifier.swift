@@ -55,7 +55,6 @@ func inspectSQLiteSQL(_ sql: String) throws -> [String] {
     while index < bytes.count {
         let byte = bytes[index]
 
-        // Line comment.
         if byte == 0x2D /* - */, index + 1 < bytes.count, bytes[index + 1] == 0x2D {
             var newline = index + 2
             while newline < bytes.count, bytes[newline] != 0x0A /* \n */ { newline += 1 }
@@ -64,7 +63,7 @@ func inspectSQLiteSQL(_ sql: String) throws -> [String] {
             continue
         }
 
-        // Block comment. SQLite block comments do not nest; treating nested
+        // SQLite block comments do not nest; treating nested
         // openers as fatal keeps the classifier fail-closed where the two
         // grammars disagree.
         if byte == 0x2F /* / */, index + 1 < bytes.count, bytes[index + 1] == 0x2A /* * */ {
@@ -87,7 +86,6 @@ func inspectSQLiteSQL(_ sql: String) throws -> [String] {
             continue
         }
 
-        // Quoted string/identifier: '...', "...", `...`.
         if byte == 0x27 /* ' */ || byte == 0x22 /* " */ || byte == 0x60 /* ` */ {
             try skipQuoted(byte)
             continue

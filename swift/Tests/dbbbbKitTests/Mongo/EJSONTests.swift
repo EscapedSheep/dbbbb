@@ -10,7 +10,6 @@ struct EJSONTests {
         let json = try EJSON.parseJSON(input)
         let value = try converter.convert(json, depth: 0)
 
-        // BSON byte round-trip.
         guard case .document(let pairs) = value else {
             Issue.record("top level must be a document", sourceLocation: sourceLocation)
             return
@@ -20,7 +19,6 @@ struct EJSONTests {
         let decoded = try reader.readDocument()
         #expect(BSONValue.document(decoded) == value, "BSON byte round-trip", sourceLocation: sourceLocation)
 
-        // EJSON text round-trip.
         let canonical = EJSONSerializer.serialize(document: decoded)
         if let expectedCanonical {
             #expect(canonical == expectedCanonical, sourceLocation: sourceLocation)

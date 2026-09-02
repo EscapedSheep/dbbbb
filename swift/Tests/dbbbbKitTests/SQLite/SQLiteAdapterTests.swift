@@ -263,7 +263,6 @@ final class SQLiteAdapterTests: XCTestCase {
         let fixture = try SQLiteFixture().populate(["CREATE TABLE t (x INTEGER)"])
         let adapter = try fixture.makeAdapter(readOnly: true)
 
-        // Reads work.
         guard case .rows = try await adapter.execute(.sql("SELECT count(*) FROM t"), options: ExecuteOptions())
         else { return XCTFail("expected rows") }
 

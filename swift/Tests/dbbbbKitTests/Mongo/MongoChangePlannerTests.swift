@@ -37,7 +37,6 @@ struct MongoChangePlannerTests {
     // MARK: DisplayValue → BSON
 
     @Test func taggedDisplayShapesRoundTrip() throws {
-        // $oid
         #expect(
             try MongoChangePlanner.bsonValue(
                 from: .object([("$oid", .string("abababababababababababab"))]), label: "d")
@@ -60,7 +59,6 @@ struct MongoChangePlannerTests {
             try MongoChangePlanner.bsonValue(
                 from: .object([("$date", .string("2023-11-14T22:13:20.000Z"))]), label: "d")
                 == .date(milliseconds: 1_700_000_000_000))
-        // $binary, $timestamp, min/max key.
         #expect(
             try MongoChangePlanner.bsonValue(
                 from: .object([("$binary", .object([

@@ -56,7 +56,6 @@ enum Decimal128Codec {
         let sign = negative ? "-" : ""
 
         if scientificExponent >= maxSignificandDigits || scientificExponent <= -7 || exponent > 0 {
-            // Scientific notation.
             if significand == 0 {
                 return "\(sign)0E\(exponent > 0 ? "+" : "")\(exponent)"
             }
