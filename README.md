@@ -1,6 +1,10 @@
 # dbbbb
 
-dbbbb is a local-first Electron database client for PostgreSQL, MongoDB, MySQL, and SQLite. It keeps SQL tables/rows and MongoDB collections/documents as separate native workflows, while sharing connections, object navigation, query history, themes, and safety controls.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+**English** | [简体中文](README.zh-CN.md)
+
+dbbbb is a local-first, open-source Electron database client for PostgreSQL, MongoDB, MySQL, and SQLite. It keeps SQL tables/rows and MongoDB collections/documents as separate native workflows, while sharing connections, object navigation, query history, themes, and safety controls.
 
 The project is usable as an early development build. Demo connections remain available, and real PostgreSQL, MongoDB, MySQL, and SQLite sessions are implemented in the Electron main process.
 
@@ -151,4 +155,8 @@ npm run package:mac
 
 Artifacts are written under `release/`. They are development artifacts without signing or notarization, so macOS Gatekeeper or Windows SmartScreen may warn. The builder configuration also declares Windows NSIS and Linux AppImage/DEB targets, but this repository does not provide verified release scripts for them yet.
 
-See [the development plan](docs/DEVELOPMENT_PLAN.md) and [the architecture notes](docs/ARCHITECTURE.md). dbbbb is licensed under the [MIT License](LICENSE).
+See [the development plan](docs/DEVELOPMENT_PLAN.md) and [the architecture notes](docs/ARCHITECTURE.md).
+
+## License
+
+dbbbb is open source, released under the [MIT License](LICENSE).
