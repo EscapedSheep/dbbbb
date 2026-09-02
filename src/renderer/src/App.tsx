@@ -7,7 +7,8 @@ import type {
   DatabaseObjectNode,
   DatabaseResult,
   ImportProgressUpdate,
-  MongoCommand
+  MongoCommand,
+  StartupAction
 } from '../../shared/database'
 import { DEFAULT_QUERY } from '../../shared/database'
 import { AppHeader } from './components/AppHeader'
@@ -18,6 +19,7 @@ import { QueryLibraryPanel } from './components/QueryLibraryPanel'
 import { RecordEditorDialog } from './components/RecordEditorDialog'
 import { Sidebar } from './components/Sidebar'
 import { Workspace } from './components/Workspace'
+import { resolveConnectionReference } from './lib/connection-reference'
 import {
   createQueryLibrary,
   type QueryEntry,
@@ -89,6 +91,9 @@ export default function App(): React.JSX.Element {
   const objectLoadVersion = useRef(0)
   const objectSelectVersion = useRef(0)
   const pendingLibraryEntry = useRef<QueryEntry | undefined>(undefined)
+  const pendingCliCommand = useRef<{ connectionId: string; text: string } | undefined>(undefined)
+  const autoRunCliQuery = useRef(false)
+  const connectionsRef = useRef<ConnectionProfile[]>([])
 
   const selectedConnection = useMemo(
     () => connections.find((connection) => connection.id === selectedConnectionId),
@@ -98,6 +103,45 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     selectedConnectionIdRef.current = selectedConnectionId
   }, [selectedConnectionId])
+
+  useEffect(() => {
+    connectionsRef.current = connections
+  }, [connections])
+
+  useEffect(() => window.dbbbb.onStartupAction((action: StartupAction) => {
+    if (action.kind === 'refresh') {
+      // A CLI add ran in the main process; reload the vault-backed list.
+      window.dbbbb
+        .listConnections()
+        .then((profiles) => {
+          connectionsRef.current = profiles
+          setConnections(profiles)
+        })
+        .catch((reason) => {
+          setAppError(reason instanceof Error ? reason.message : 'Could not load connections.')
+        })
+      return
+    }
+    if (!action.connection) return
+    const resolution = resolveConnectionReference(connectionsRef.current, action.connection)
+    if ('error' in resolution) {
+      setAppError(resolution.error)
+      return
+    }
+    const connection = resolution.connection
+    if (action.kind === 'query') {
+      autoRunCliQuery.current = true
+      if (connection.id === selectedConnectionIdRef.current) {
+        setQuery(action.command)
+        setResult(undefined)
+        setQueryError(undefined)
+      } else {
+        // The selection effect injects the command after the switch.
+        pendingCliCommand.current = { connectionId: connection.id, text: action.command }
+      }
+    }
+    setSelectedConnectionId(connection.id)
+  }), [])
 
   useEffect(() => window.dbbbb.onImportProgress((update: ImportProgressUpdate) => {
     if (update.token !== importTokenRef.current) return
@@ -203,11 +247,22 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     if (!selectedConnection) return
     const pending = pendingLibraryEntry.current
+    const pendingCli = pendingCliCommand.current
+    // A CLI query injects its command text; for MongoDB the collection is
+    // filled in once objects load, so the command starts without one.
+    const cliCommand: DatabaseCommand | undefined =
+      pendingCli && pendingCli.connectionId === selectedConnection.id
+        ? selectedConnection.engine === 'mongodb'
+          ? { engine: 'mongodb', kind: 'find', collection: '', text: pendingCli.text }
+          : { engine: selectedConnection.engine, kind: 'query', text: pendingCli.text }
+        : undefined
     const command =
-      pending && pending.connectionId === selectedConnection.id
+      cliCommand ??
+      (pending && pending.connectionId === selectedConnection.id
         ? pending.command
-        : DEFAULT_QUERY[selectedConnection.engine]
+        : DEFAULT_QUERY[selectedConnection.engine])
     pendingLibraryEntry.current = undefined
+    pendingCliCommand.current = undefined
     setQuery(command.text)
     if (command.engine === 'mongodb') {
       setMongoMode(command.kind)
@@ -305,6 +360,16 @@ export default function App(): React.JSX.Element {
       }
     }
   }, [mongoCollection, mongoMode, previewContext, query, queryLibrary, queryLoading, selectedConnection])
+
+  // Runs a CLI `query` command once React has committed the injected text:
+  // runQuery's identity changes with the query state it closes over. For
+  // MongoDB the run waits until the objects effect picks a collection.
+  useEffect(() => {
+    if (!autoRunCliQuery.current || !selectedConnection) return
+    if (selectedConnection.engine === 'mongodb' && mongoCollection.trim().length === 0) return
+    autoRunCliQuery.current = false
+    void runQuery()
+  }, [runQuery, selectedConnection, mongoCollection])
 
   const cancelQuery = useCallback(async (): Promise<void> => {
     const request = activeRequest.current

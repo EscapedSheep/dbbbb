@@ -43,7 +43,8 @@ const api: DbbbbApi = {
   chooseImportFile: vi.fn(async () => undefined),
   startImport: vi.fn(async () => ({ processed: 0, inserted: 0, failed: 0 })),
   cancelImport: vi.fn(async () => undefined),
-  onImportProgress: vi.fn(() => () => undefined)
+  onImportProgress: vi.fn(() => () => undefined),
+  onStartupAction: vi.fn(() => () => undefined)
 }
 
 describe('App vertical slice', () => {
