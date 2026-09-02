@@ -1,10 +1,14 @@
 import { join } from 'node:path'
 import { writeFile } from 'node:fs/promises'
 import { app, BrowserWindow, shell } from 'electron'
+import { CLI_USAGE, parseCliArgs } from './cli'
+import type { CliAction } from './cli'
 import { registerDatabaseIpc } from './database-ipc'
 import { DatabaseService } from './database-service'
 import { ConnectionVault } from './profiles/connection-vault'
 import { ElectronSafeStorageProtector } from './profiles/electron-safe-storage-protector'
+import { IPC_CHANNELS } from '../shared/database'
+import type { ConnectionInput, StartupAction } from '../shared/database'
 import {
   decideWindowOpen,
   FILE_RENDERER_CSP,
@@ -17,7 +21,31 @@ let databaseShutdownStarted = false
 let closeDatabaseIpc: (() => void) | undefined
 let databaseService: DatabaseService | undefined
 let databaseInitialization: Promise<void> | undefined
+let pendingStartupAction: StartupAction | undefined
 const SHUTDOWN_WATCHDOG_MS = 5_000
+
+function deliverPendingStartupAction(): void {
+  const action = pendingStartupAction
+  if (!mainWindow || !action) return
+  if (mainWindow.webContents.isLoading()) {
+    mainWindow.webContents.once('did-finish-load', deliverPendingStartupAction)
+    return
+  }
+  pendingStartupAction = undefined
+  mainWindow.webContents.send(IPC_CHANNELS.startupAction, action)
+}
+
+function sendStartupAction(action: StartupAction): void {
+  pendingStartupAction = action
+  if (mainWindow) deliverPendingStartupAction()
+  else createWindow()
+}
+
+function focusMainWindow(): void {
+  if (!mainWindow) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.focus()
+}
 
 function createWindow(): void {
   if (databaseShutdownStarted) return
@@ -134,26 +162,79 @@ function createWindow(): void {
     void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
 
+  mainWindow.webContents.once('did-finish-load', deliverPendingStartupAction)
+
   mainWindow.on('closed', () => {
     mainWindow = null
   })
+}
+
+// Packaged builds put user arguments right after the executable path; dev
+// runs add the electron-vite entry point as a second argv entry.
+const cliResult = parseCliArgs(process.argv.slice(app.isPackaged ? 1 : 2))
+const cliAction: CliAction | undefined =
+  cliResult && 'action' in cliResult ? cliResult.action : undefined
+
+// Help and parse errors exit without starting the app; the exit is deferred
+// to the stream flush callback so the message is not truncated.
+const cliExitsImmediately = Boolean(
+  (cliResult && 'error' in cliResult) || cliAction?.kind === 'help'
+)
+
+if (cliResult && 'error' in cliResult) {
+  process.stderr.write(`${cliResult.error}\n\n${CLI_USAGE}\n`, () => app.exit(1))
+} else if (cliAction?.kind === 'help') {
+  process.stdout.write(`${CLI_USAGE}\n`, () => app.exit(0))
 }
 
 // Only this process may write the connection vault; refuse a second instance
 // so two processes can never race a vault write.
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) {
+  // The running instance receives and executes these arguments instead.
+  if (cliAction) process.stdout.write('forwarded to running dbbbb instance\n')
   app.quit()
 }
 
-app.on('second-instance', () => {
-  if (!mainWindow) return
-  if (mainWindow.isMinimized()) mainWindow.restore()
-  mainWindow.focus()
+function addConnectionFromCli(input: ConnectionInput): void {
+  const service = databaseService
+  if (!service) {
+    process.stderr.write('add failed: the database service is not ready yet.\n')
+    return
+  }
+  void service.connect(input).then(
+    () => sendStartupAction({ kind: 'refresh' }),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : 'The connection failed.'
+      process.stderr.write(`add failed: ${message}\n`)
+    }
+  )
+}
+
+app.on('second-instance', (_event, commandLine) => {
+  const result = parseCliArgs(commandLine.slice(app.isPackaged ? 1 : 2))
+  if (result && 'error' in result) {
+    process.stderr.write(`${result.error}\n`)
+    return
+  }
+  const action = result && 'action' in result ? result.action : undefined
+  if (!action || action.kind === 'help' || action.kind === 'open') {
+    focusMainWindow()
+    if (action?.kind === 'open' && action.connection) {
+      sendStartupAction({ kind: 'open', connection: action.connection })
+    }
+    return
+  }
+  if (action.kind === 'add') {
+    addConnectionFromCli(action.input)
+    return
+  }
+  focusMainWindow()
+  sendStartupAction({ kind: 'query', connection: action.connection, command: action.command })
 })
 
 void app.whenReady().then(async () => {
-  if (!hasSingleInstanceLock || databaseShutdownStarted) return
+  if (!hasSingleInstanceLock || databaseShutdownStarted || cliExitsImmediately) return
   const vault = new ConnectionVault(
     join(app.getPath('userData'), 'connections.vault.json'),
     new ElectronSafeStorageProtector()
@@ -164,8 +245,30 @@ void app.whenReady().then(async () => {
   await databaseInitialization
   if (databaseShutdownStarted) return
 
+  if (cliAction?.kind === 'add') {
+    // A CLI add only touches the vault; no window is created.
+    try {
+      const profile = await service.connect(cliAction.input)
+      process.stdout.write(`added ${profile.name} (${profile.id})\n`, () => app.exit(0))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'The connection failed.'
+      process.stderr.write(`add failed: ${message}\n`, () => app.exit(1))
+    }
+    return
+  }
+
   closeDatabaseIpc = registerDatabaseIpc(service, () => mainWindow)
-  createWindow()
+  // A second-instance action may already have created the window.
+  if (!mainWindow) createWindow()
+  if (cliAction?.kind === 'open' && cliAction.connection) {
+    sendStartupAction({ kind: 'open', connection: cliAction.connection })
+  } else if (cliAction?.kind === 'query') {
+    sendStartupAction({
+      kind: 'query',
+      connection: cliAction.connection,
+      command: cliAction.command
+    })
+  }
 
   app.on('activate', () => {
     if (!databaseShutdownStarted && BrowserWindow.getAllWindows().length === 0) {
