@@ -11,11 +11,13 @@ import type {
   ImportProgressUpdate,
   StartImportRequest,
   DbbbbApi,
-  PreviewRequest
+  PreviewRequest,
+  StartupAction
 } from '../shared/database'
 import { IPC_CHANNELS } from '../shared/database'
 
 let activeImportProgressUnsubscribe: (() => void) | undefined
+let activeStartupActionUnsubscribe: (() => void) | undefined
 
 const api: DbbbbApi = {
   listConnections: () => ipcRenderer.invoke(IPC_CHANNELS.listConnections),
@@ -62,6 +64,29 @@ const api: DbbbbApi = {
       }
     }
     activeImportProgressUnsubscribe = unsubscribe
+    return unsubscribe
+  },
+  onStartupAction: (listener: (action: StartupAction) => void) => {
+    if (typeof listener !== 'function') {
+      throw new TypeError('Startup action listener must be a function.')
+    }
+    // Only one startup action stream is live at a time; drop a previous
+    // subscription so repeated mounts cannot accumulate listeners.
+    activeStartupActionUnsubscribe?.()
+    const wrapped = (_event: IpcRendererEvent, action: StartupAction): void => {
+      listener(action)
+    }
+    ipcRenderer.on(IPC_CHANNELS.startupAction, wrapped)
+    let subscribed = true
+    const unsubscribe = (): void => {
+      if (!subscribed) return
+      subscribed = false
+      ipcRenderer.removeListener(IPC_CHANNELS.startupAction, wrapped)
+      if (activeStartupActionUnsubscribe === unsubscribe) {
+        activeStartupActionUnsubscribe = undefined
+      }
+    }
+    activeStartupActionUnsubscribe = unsubscribe
     return unsubscribe
   }
 }

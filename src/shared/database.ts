@@ -230,6 +230,16 @@ export interface ImportProgressUpdate {
   totalBytes: number
 }
 
+/**
+ * Action pushed from the main process after a CLI invocation targets this
+ * window: select a connection, run a command on it, or reload the connection
+ * list after a connection was added from another process.
+ */
+export type StartupAction =
+  | { kind: 'open'; connection?: string }
+  | { kind: 'query'; connection: string; command: string }
+  | { kind: 'refresh' }
+
 export interface DbbbbApi {
   listConnections: () => Promise<ConnectionProfile[]>
   getStartupWarnings: () => Promise<string[]>
@@ -247,6 +257,7 @@ export interface DbbbbApi {
   startImport: (request: StartImportRequest) => Promise<ImportResult>
   cancelImport: (token: string) => Promise<void>
   onImportProgress: (listener: (update: ImportProgressUpdate) => void) => () => void
+  onStartupAction: (listener: (action: StartupAction) => void) => () => void
 }
 
 export const IPC_CHANNELS = {
@@ -265,7 +276,8 @@ export const IPC_CHANNELS = {
   chooseImportFile: 'database:choose-import-file',
   startImport: 'database:start-import',
   cancelImport: 'database:cancel-import',
-  importProgress: 'database:import-progress'
+  importProgress: 'database:import-progress',
+  startupAction: 'database:startup-action'
 } as const
 
 export const DEFAULT_QUERY: Record<DatabaseEngine, DatabaseCommand> = {

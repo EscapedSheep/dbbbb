@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { IpcRendererEvent } from 'electron'
-import type { ImportProgressUpdate, DbbbbApi } from '../shared/database'
+import type { ImportProgressUpdate, DbbbbApi, StartupAction } from '../shared/database'
 import { IPC_CHANNELS } from '../shared/database'
 
 const electronMocks = vi.hoisted(() => ({
@@ -77,7 +77,7 @@ describe('preload invoke contract', () => {
 
   it('exposes exactly the DbbbbApi surface without extra or missing keys', () => {
     expect(Object.keys(exposedApi()).sort()).toEqual(
-      [...INVOKE_METHOD_NAMES, 'onImportProgress'].sort()
+      [...INVOKE_METHOD_NAMES, 'onImportProgress', 'onStartupAction'].sort()
     )
   })
 })
@@ -148,6 +148,57 @@ describe('preload import progress subscription', () => {
     expect(electronMocks.removeListener).toHaveBeenLastCalledWith(
       IPC_CHANNELS.importProgress,
       secondWrapped
+    )
+  })
+})
+
+describe('preload startup action subscription', () => {
+  it('forwards actions without exposing the Electron event and unsubscribes idempotently', () => {
+    const listener = vi.fn()
+    const api = exposedApi()
+    const action: StartupAction = { kind: 'query', connection: 'my-db', command: 'select 1' }
+
+    const unsubscribe = api.onStartupAction(listener)
+    expect(electronMocks.on).toHaveBeenCalledWith(
+      IPC_CHANNELS.startupAction,
+      expect.any(Function)
+    )
+    const wrapped = electronMocks.on.mock.calls[0]?.[1] as (
+      event: IpcRendererEvent,
+      action: StartupAction
+    ) => void
+    const electronEvent = { senderId: 42 } as unknown as IpcRendererEvent
+    wrapped(electronEvent, action)
+
+    expect(listener).toHaveBeenCalledWith(action)
+    expect(listener).not.toHaveBeenCalledWith(electronEvent, action)
+
+    unsubscribe()
+    unsubscribe()
+    expect(electronMocks.removeListener).toHaveBeenCalledOnce()
+    expect(electronMocks.removeListener).toHaveBeenCalledWith(
+      IPC_CHANNELS.startupAction,
+      wrapped
+    )
+  })
+
+  it('rejects a non-function listener before registering it', () => {
+    const api = exposedApi()
+
+    expect(() => api.onStartupAction(undefined as never)).toThrow(/must be a function/i)
+    expect(electronMocks.on).not.toHaveBeenCalled()
+  })
+
+  it('unsubscribes a previous startup action listener when subscribing again', () => {
+    const api = exposedApi()
+
+    api.onStartupAction(vi.fn())
+    const firstWrapped = electronMocks.on.mock.calls[0]?.[1]
+    api.onStartupAction(vi.fn())
+
+    expect(electronMocks.removeListener).toHaveBeenCalledWith(
+      IPC_CHANNELS.startupAction,
+      firstWrapped
     )
   })
 })
