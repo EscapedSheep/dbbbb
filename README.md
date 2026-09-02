@@ -49,6 +49,35 @@ npm run dev
 
 The application starts with demo PostgreSQL and MongoDB connections, so the UI can be explored without a database server. Use **New connection** to open a real session. Credentials cross the preload boundary only for connection setup. They stay in the main-process session by default; the opt-in **Remember and reconnect** path stores only an OS-protected encrypted record as described above.
 
+## Command line
+
+dbbbb accepts a small command-line interface. Only one instance runs at a time: when the app is already open, arguments are forwarded to the running instance, and `add` executes there because only that process may write the credential vault.
+
+```bash
+dbbbb open [connection]                  # open the window and select a connection (id or name)
+dbbbb query <connection> "select 1"      # select a connection, fill the editor, and run
+dbbbb add --engine postgres --host db.internal --database orders [--port 5432] [--user U] [--password W] [--name N] [--read-only]
+dbbbb add --engine mysql --host 127.0.0.1 --database shop [--port 3306] ...
+dbbbb add --engine mongodb --uri mongodb://localhost:27017/catalog [--name N] [--read-only]
+dbbbb add --engine sqlite --file /path/to/audit.db [--name N] [--read-only]
+dbbbb --help
+```
+
+`add` connects once to verify the input, remembers the connection like the dialog's **Remember and reconnect**, prints `added <name> (<id>)`, and exits without opening a window. A MongoDB URI must carry its database in the path; `mongodb+srv://` enables TLS automatically. `query` treats the command as SQL for PostgreSQL/MySQL/SQLite and as a canonical-EJSON `find` filter on the first collection for MongoDB.
+
+In development, arguments after `--` reach the app:
+
+```bash
+npm run dev -- query mydb "select 1"
+```
+
+Against a packaged macOS build:
+
+```bash
+/Applications/dbbbb.app/Contents/MacOS/dbbbb query mydb "select 1"
+open -a dbbbb --args query mydb "select 1"
+```
+
 ## Verify
 
 Run the normal type, unit/component, and production-bundle checks:
