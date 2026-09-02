@@ -8,7 +8,7 @@
 
 dbbbb：本地优先的 macOS 数据库客户端，支持 PostgreSQL / MySQL / MongoDB / SQLite 四引擎。定位：打开连接、定位数据、安全地做审慎修改，不要全功能 DBA 套件的视觉重量。
 
-仓库里有两代实现（无 git 仓库，本地目录）：
+仓库里有两代实现（git 仓库，remote 为 git@github.com:EscapedSheep/dbbbb.git）：
 
 - `swift/` — **现行版**。Swift 6.3 + SwiftUI 原生重写（SwiftPM，macOS 15+）。
   - 构建：`cd swift && swift build`；运行：`swift run`（或 `.build/debug/dbbbb`）
@@ -117,7 +117,7 @@ dbbbb：本地优先的 macOS 数据库客户端，支持 PostgreSQL / MySQL / M
   - MySQL：`mysqld --initialize-insecure --datadir=/tmp/dbbbb-it/mysql/data` → `mysqld --datadir=... --port=53306 --bind-address=127.0.0.1 --mysqlx=OFF &` → 建 root 密码 `dbbbb` + `dbbbb_test` 库 + 种子表 `dbbbb_it_seed`（2 行，preview 测试需要）。
   - Mongo：`mongod --dbpath /tmp/dbbbb-it/mongo/db --port 57017 --bind_ip 127.0.0.1 &`（无 auth）。
   - env：`DBBBB_TEST_POSTGRES_URL='postgres://$USER@127.0.0.1:55432/dbbbb_test?sslmode=disable'`、`DBBBB_TEST_MYSQL_URL='mysql://root:dbbbb@127.0.0.1:53306/dbbbb_test'`、`DBBBB_TEST_MONGO_URL='mongodb://127.0.0.1:57017/dbbbb_test'`。
-- 无 git 仓库（历史决策只存在于本文件与对话记录）。
+- Git 仓库已建（main 分支，remote `origin`=GitHub EscapedSheep/dbbbb）：v0.1.0 标签 + GitHub Release 已发（Electron 版 DMG/ZIP）；Swift 版产物名曾误入 LineDB（未提交、已清理），正确名一律 dbbbb。
 
 ## 8. 快速恢复上下文（30 秒版）
 
