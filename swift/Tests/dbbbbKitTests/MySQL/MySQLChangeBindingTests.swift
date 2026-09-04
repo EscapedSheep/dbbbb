@@ -96,7 +96,7 @@ final class MySQLChangeBindingTests: XCTestCase {
             ("status", .string("paid")), ("note", .string("ready")), ("unchanged", .number(4)),
         ]
         let plan = try MySQLChangePlanner.planUpdate(
-            database: "sales", table: "orders",
+            database: "sales", table: "orders", columnTypes: [:],
             primaryKey: primaryKey, original: original, current: current)
         let columns = MySQLChangeMapper.bindColumns(
             primaryKey: primaryKey, original: original, current: current)
@@ -118,7 +118,8 @@ final class MySQLChangeBindingTests: XCTestCase {
             ("id", .number(42)), ("email", .string("before@example.test")), ("active", .bool(true)),
         ]
         let plan = try MySQLChangePlanner.planDelete(
-            database: "shop", table: "users", primaryKey: primaryKey, original: original)
+            database: "shop", table: "users", columnTypes: [:],
+            primaryKey: primaryKey, original: original)
         let columns = MySQLChangeMapper.bindColumns(
             primaryKey: primaryKey, original: original, current: nil)
         XCTAssertEqual(columns, ["id", "email", "active"])

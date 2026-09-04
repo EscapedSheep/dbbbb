@@ -140,16 +140,55 @@ final class ConnectionStoreTests: XCTestCase {
         // Saving must not clobber a file whose schema we do not understand.
         try store.save(PersistedConnection(id: UUID(), input: postgresInput()), secret: "s3cret")
         XCTAssertEqual(try String(contentsOf: manifestURL, encoding: .utf8), foreign)
+        XCTAssertTrue(try corruptBackups().isEmpty, "a foreign-version file is never renamed")
     }
 
-    func testCorruptFileIsRewritable() throws {
+    func testCorruptFileIsBackedUpThenRewritable() throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try "not json at all".write(to: manifestURL, atomically: false, encoding: .utf8)
 
         let store = makeStore()
         XCTAssertTrue(store.loadConnections().isEmpty)
+        // The corrupt original is quarantined before any rewrite, never lost.
+        let backups = try corruptBackups()
+        XCTAssertEqual(backups.count, 1)
+        XCTAssertEqual(try String(contentsOf: backups[0], encoding: .utf8), "not json at all")
+
         try store.save(PersistedConnection(id: UUID(), input: postgresInput()), secret: "s3cret")
         XCTAssertEqual(makeStore().loadConnections().count, 1)
+        XCTAssertEqual(try corruptBackups().count, 1, "the backup survives the rewrite")
+    }
+
+    func testMissingVersionKeyIsBackedUpThenRewritable() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try #"{"connections": []}"#.write(to: manifestURL, atomically: false, encoding: .utf8)
+
+        let store = makeStore()
+        XCTAssertTrue(store.loadConnections().isEmpty)
+        XCTAssertEqual(try corruptBackups().count, 1)
+        try store.save(PersistedConnection(id: UUID(), input: postgresInput()), secret: "s3cret")
+        XCTAssertEqual(makeStore().loadConnections().count, 1)
+    }
+
+    /// Fail-closed: when the corrupt file cannot be moved aside (directory not
+    /// writable), the store must leave it alone instead of clobbering it.
+    func testUnbackuppableCorruptFileIsNeverClobbered() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try "not json at all".write(to: manifestURL, atomically: false, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path) }
+
+        let store = makeStore()
+        XCTAssertTrue(store.loadConnections().isEmpty)
+        try store.save(PersistedConnection(id: UUID(), input: postgresInput()), secret: "s3cret")
+        XCTAssertEqual(try String(contentsOf: manifestURL, encoding: .utf8), "not json at all")
+        XCTAssertTrue(try corruptBackups().isEmpty)
+    }
+
+    private func corruptBackups() throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("connections.json.corrupt-") }
+            .map { directory.appendingPathComponent($0) }
     }
 
     func testDuplicateIDsAreDroppedOnLoad() throws {
@@ -193,5 +232,13 @@ final class ConnectionStoreTests: XCTestCase {
         try makeStore().save(PersistedConnection(id: UUID(), input: postgresInput()), secret: "s3cret")
         let attributes = try FileManager.default.attributesOfItem(atPath: manifestURL.path)
         XCTAssertEqual(attributes[.posixPermissions] as? Int, 0o600)
+    }
+
+    func testPreExistingDirectoryIsTightenedTo0700() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path)
+        try makeStore().save(PersistedConnection(id: UUID(), input: postgresInput()), secret: "s3cret")
+        let attributes = try FileManager.default.attributesOfItem(atPath: directory.path)
+        XCTAssertEqual(attributes[.posixPermissions] as? Int, 0o700)
     }
 }

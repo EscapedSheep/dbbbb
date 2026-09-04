@@ -13,10 +13,17 @@
 #
 # Signing: AD-HOC ONLY (codesign --sign -). This machine currently has zero
 # valid codesigning identities (`security find-identity -v -p codesigning`),
-# so Developer ID signing and notarization are not possible here. Ad-hoc
-# signing still gives the bundle a stable designated requirement, which keeps
-# Keychain items (service names like `dev.dbbbb.connection`) accessible as
-# long as the bundle identifier and keychain service names stay unchanged.
+# so Developer ID signing and notarization are not possible here.
+#
+# Keychain caveat: an ad-hoc signature's designated requirement is anchored
+# on the binary's cdhash — a hash of the binary's contents that changes with
+# every rebuild. Keychain items (service names like `dev.dbbbb.connection`)
+# are therefore NOT seamlessly shared across rebuilds: macOS re-prompts for
+# authorization each time the binary changes, even with an unchanged bundle
+# identifier. Once the app is signed with a Developer ID, the designated
+# requirement anchors on the team ID + bundle identifier instead, which is
+# stable across builds, so Keychain items created by earlier properly signed
+# builds stay accessible without re-prompting.
 #
 # ── Upgrading to Developer ID + notarization once credentials exist ──
 # Replace the ad-hoc codesign step below with:
@@ -42,7 +49,10 @@ set -euo pipefail
 # ── Configuration ────────────────────────────────────────────────────────────
 APP_NAME="dbbbb"
 BUNDLE_ID="dev.dbbbb"
-VERSION="0.2.0"
+# Fallback version, used only when HEAD carries no exact git tag. When HEAD
+# is tagged, the tag is the single source of truth and must agree with this
+# constant — a mismatch is a hard error (update the constant or fix the tag).
+FALLBACK_VERSION="0.2.0"
 MIN_MACOS="15.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,8 +62,32 @@ RELEASE_DIR="$SWIFT_DIR/release"
 ICON_SRC="$REPO_ROOT/build/icon.png"
 ARCH="$(uname -m)"
 
+if TAG="$(git -C "$REPO_ROOT" describe --tags --exact-match HEAD 2>/dev/null)"; then
+  VERSION="${TAG#v}"
+  if [[ "$VERSION" != "$FALLBACK_VERSION" ]]; then
+    echo "error: git tag '$TAG' implies version '$VERSION' but FALLBACK_VERSION is '$FALLBACK_VERSION';" >&2
+    echo "       update FALLBACK_VERSION in this script or move the tag" >&2
+    exit 1
+  fi
+else
+  VERSION="$FALLBACK_VERSION"
+fi
+
 APP_DIR="$RELEASE_DIR/$APP_NAME.app"
 ZIP_PATH="$RELEASE_DIR/$APP_NAME-$VERSION-macOS-$ARCH.zip"
+
+# Temp dirs created below (iconset, zip re-extraction, smoke-test HOME) and
+# the smoke-test app process are always cleaned up, even on failure.
+TMP_DIRS=()
+cleanup() {
+  if [[ -n "${APP_PID:-}" ]]; then
+    kill "$APP_PID" 2>/dev/null || true
+  fi
+  if ((${#TMP_DIRS[@]})); then
+    rm -rf "${TMP_DIRS[@]}"
+  fi
+}
+trap cleanup EXIT
 
 echo "==> Packaging $APP_NAME $VERSION ($ARCH)"
 
@@ -121,7 +155,9 @@ EOF
 
 # ── 4. Icon: build AppIcon.icns from build/icon.png via iconutil ────────────
 echo "==> Generating AppIcon.icns from $ICON_SRC"
-ICONSET="$(mktemp -d)/AppIcon.iconset"
+ICONSET_TMP="$(mktemp -d)"
+TMP_DIRS+=("$ICONSET_TMP")
+ICONSET="$ICONSET_TMP/AppIcon.iconset"
 mkdir -p "$ICONSET"
 for spec in "16:16" "32:16" "32:32" "64:32" "128:128" "256:128" "256:256" "512:256" "512:512" "1024:512"; do
   px="${spec%%:*}"
@@ -159,16 +195,43 @@ cd "$RELEASE_DIR"
 rm -f "$ZIP_PATH"
 ditto -c -k --sequesterRsrc --keepParent "$APP_NAME.app" "$(basename "$ZIP_PATH")"
 
+echo "==> Verifying zip integrity (re-extract)"
+ZIP_VERIFY_DIR="$(mktemp -d)"
+TMP_DIRS+=("$ZIP_VERIFY_DIR")
+ditto -x -k "$ZIP_PATH" "$ZIP_VERIFY_DIR"
+[[ -x "$ZIP_VERIFY_DIR/$APP_NAME.app/Contents/MacOS/$APP_NAME" ]] \
+  || { echo "error: re-extracted zip is missing the app executable" >&2; exit 1; }
+
 # ── 7. Smoke test: launch the bundled app, confirm it stays alive ───────────
 if [[ "${SKIP_SMOKE_TEST:-0}" != "1" ]]; then
-  echo "==> Smoke test: launching bundled app for 8s"
-  "$APP_DIR/Contents/MacOS/$APP_NAME" >/dev/null 2>&1 &
+  echo "==> Smoke test: launching bundled app for 8s (sandboxed from real user data)"
+  # Isolation: the smoke instance must not read or write the real user's
+  # ~/Library/Application Support/dbbbb and must not eagerly reconnect the
+  # real user's saved connections. A HOME override alone is NOT sufficient —
+  # on macOS NSHomeDirectory()/FileManager ignore the HOME env var — so the
+  # real mechanism is a Seatbelt profile (sandbox-exec) denying access to the
+  # real data directory and to outbound networking. The throwaway HOME is
+  # kept only as belt-and-braces for anything that does honor it.
+  SMOKE_HOME="$(mktemp -d)"
+  TMP_DIRS+=("$SMOKE_HOME")
+  SMOKE_PROFILE="$SMOKE_HOME/smoke.sb"
+  cat > "$SMOKE_PROFILE" <<EOF
+(version 1)
+(allow default)
+(deny file-read* file-write*
+  (literal "$HOME/Library/Application Support/$APP_NAME")
+  (subpath "$HOME/Library/Application Support/$APP_NAME"))
+(deny network-outbound)
+EOF
+  HOME="$SMOKE_HOME" sandbox-exec -f "$SMOKE_PROFILE" \
+    "$APP_DIR/Contents/MacOS/$APP_NAME" >/dev/null 2>&1 &
   APP_PID=$!
   sleep 8
   if kill -0 "$APP_PID" 2>/dev/null; then
     echo "==> Smoke test passed (pid $APP_PID alive after 8s); terminating"
     kill "$APP_PID" 2>/dev/null || true
     wait "$APP_PID" 2>/dev/null || true
+    APP_PID=""
   else
     echo "error: bundled app exited or crashed within 8s" >&2
     exit 1

@@ -147,7 +147,7 @@ public enum ConnectionInput: Codable, Sendable {
 
     static func redactMongoURI(_ uri: String) -> String {
         guard let schemeRange = uri.range(of: "://"),
-              let atRange = uri.range(of: "@", range: schemeRange.upperBound..<uri.endIndex) else { return uri }
+              let atRange = uri.range(of: "@", options: .backwards, range: schemeRange.upperBound..<uri.endIndex) else { return uri }
         return uri.replacingCharacters(in: schemeRange.upperBound..<atRange.lowerBound, with: "***")
     }
 }

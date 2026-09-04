@@ -1,5 +1,9 @@
 # dbbbb development plan
 
+> **⛔ DEPRECATED — historical reference only / 已废弃，仅作历史参考。**
+> This document describes the retired Electron implementation (`src/`), which is no longer developed. The current product is the native Swift app under `swift/`; see `HANDOVER.md` and `README.md` for the current state.
+> 本文档描述的是已废弃的 Electron 版（`src/`），不再维护。现行实现为 `swift/` 目录下的 Swift 原生版（Swift 6 + SwiftUI），现状见仓库根目录 `HANDOVER.md` 与 `README.md`。
+
 ## Product promise
 
 Open a connection, locate data, and make a safe, deliberate change without the visual weight of a full database administration suite.

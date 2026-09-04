@@ -82,6 +82,16 @@ struct MongoAdapterGuardTests {
         #expect { try MongoAdapter.collectionName(from: "sqlite:abc", database: "db") } throws: { _ in true }
     }
 
+    // MARK: Timeout semantics
+
+    /// timeout <= .zero disables the timeout (same as PG/MySQL): maxTimeMS 0
+    /// is the server's "no limit" sentinel, never 1ms.
+    @Test func zeroTimeoutMeansNoTimeout() {
+        #expect(MongoAdapter.timeoutMilliseconds(.zero) == 0)
+        #expect(MongoAdapter.timeoutMilliseconds(.milliseconds(250)) == 250)
+        #expect(MongoAdapter.timeoutMilliseconds(.seconds(10_000_000)) == Int64(Int32.max))
+    }
+
     // MARK: Error mapping
 
     @Test func errorRedaction() {

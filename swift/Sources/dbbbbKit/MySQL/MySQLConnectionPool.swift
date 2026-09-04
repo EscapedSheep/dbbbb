@@ -68,6 +68,9 @@ enum MySQLConnector {
         }
 
         do {
+            if config.tlsConfiguration != nil {
+                try await assertTLSEstablished(connection)
+            }
             if config.readOnly, session == .standard {
                 // Server-side enforcement behind the client-side classifier.
                 // A session that refuses read-only mode is destroyed by the caller.
@@ -77,6 +80,17 @@ enum MySQLConnector {
         } catch {
             try? await connection.close().get()
             throw error
+        }
+    }
+
+    /// Fail-closed TLS proof. MySQLNIO silently continues in plaintext when the
+    /// server handshake lacks CLIENT_SSL, so a `require`/`verifyFull` session
+    /// must verify the negotiated wire before it serves anything: an encrypted
+    /// session reports a non-empty Ssl_cipher status.
+    private static func assertTLSEstablished(_ connection: MySQLConnection) async throws {
+        let rows = try await connection.simpleQuery("SHOW STATUS LIKE 'Ssl_cipher'").get()
+        guard let cipher = rows.first?.column("Value")?.string, !cipher.isEmpty else {
+            throw MySQLAdapterError.tlsRequired
         }
     }
 

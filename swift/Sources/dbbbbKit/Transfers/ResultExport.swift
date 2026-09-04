@@ -22,6 +22,8 @@ public enum ResultExportError: dbbbbError, Equatable {
 /// Stable, compact JSON for already-normalized display values, ported from the
 /// Electron `canonicalJson`: object keys are sorted, separators are compact,
 /// and precision-sensitive values (which cross as strings) stay strings.
+/// Used for nested values inside CSV cells; MongoDB document JSONL export
+/// goes through the EJSON layer instead (`EJSONSerializer`).
 public enum CanonicalJSON {
     private static let maxDepth = 100
 
@@ -104,9 +106,17 @@ public struct ExportedResult: Sendable, Equatable {
 }
 
 /// Serializes the *displayed* query result — already capped by the execution
-/// bounds — exactly as the Electron `result-export.ts` does: row results
-/// become CSV (header + CRLF records), document results become canonical
-/// JSONL (one compact JSON document per LF-terminated line).
+/// bounds. Row results become CSV (header + CRLF records); document results
+/// become canonical Extended JSONL (one compact EJSON document per
+/// LF-terminated line, keys in their original BSON order) so a MongoDB
+/// export re-imports with BSON types intact.
+///
+/// CSV formula-injection neutralization: string cells and header names that
+/// start with `=`, `+`, `-`, or `@` are prefixed with a single quote `'` —
+/// the industry-standard mitigation so spreadsheet apps (Excel, Numbers)
+/// display the text instead of executing it as a formula. Trade-off: the
+/// quote becomes part of the exported text, so re-importing such a CSV
+/// carries the leading `'` into the stored value.
 public enum ResultExporter {
     public static func exportData(for result: QueryResult) throws -> ExportedResult {
         switch result {
@@ -118,7 +128,7 @@ public enum ResultExporter {
     }
 
     private static func csvExport(columns: [ColumnMeta], rows: [[DisplayValue]]) throws -> ExportedResult {
-        var text = CSVSerializer.record(columns.map(\.name))
+        var text = CSVSerializer.record(columns.map { neutralizeFormula($0.name) })
         for row in rows {
             guard row.count == columns.count else { throw ResultExportError.invalidShape }
             text += CSVSerializer.record(try row.map(csvCell))
@@ -126,9 +136,20 @@ public enum ResultExporter {
         return ExportedResult(data: Data(text.utf8), fileExtension: "csv", rows: rows.count)
     }
 
+    /// Formula-injection neutralization: a spreadsheet cell whose text starts
+    /// with `=`, `+`, `-`, or `@` would be evaluated as a formula when opened
+    /// in Excel/Numbers, so it is prefixed with a single quote. Numbers,
+    /// nulls, and empty strings are not affected. See the `ResultExporter`
+    /// doc comment for the re-import trade-off.
+    static func neutralizeFormula(_ text: String) -> String {
+        guard let first = text.first, "=+-@".contains(first) else { return text }
+        return "'" + text
+    }
+
     /// One CSV cell, mirroring the Electron `csvCell`: scalars cross as their
     /// plain text, nested values as canonical JSON, and anything without a
-    /// portable representation fails closed.
+    /// portable representation fails closed. String cells pass through
+    /// `neutralizeFormula` before serialization.
     private static func csvCell(_ value: DisplayValue) throws -> String {
         switch value {
         case .null:
@@ -141,7 +162,7 @@ public enum ResultExporter {
             }
             return text
         case .string(let string):
-            return string
+            return neutralizeFormula(string)
         case .array, .object:
             return try CanonicalJSON.serialize(value)
         case .binary:
@@ -149,11 +170,17 @@ public enum ResultExporter {
         }
     }
 
+    /// Canonical EJSON lines via the project's own Extended JSON codec: keys
+    /// keep their BSON order, tagged display values pass through verbatim, and
+    /// bare numbers are emitted as `$numberDouble`, so the export re-imports
+    /// through `MongoImportPlanner` with BSON types intact. Documents with
+    /// unsupported tags (`$code`, …) still export but remain fail-closed on
+    /// import — see `EJSONSerializer.serialize(displayValue:)`.
     private static func jsonLinesExport(documents: [DisplayValue]) throws -> ExportedResult {
         var text = ""
         for document in documents {
             guard case .object = document else { throw ResultExportError.invalidShape }
-            text += try CanonicalJSON.serialize(document) + "\n"
+            text += try EJSONSerializer.serialize(displayValue: document) + "\n"
         }
         return ExportedResult(data: Data(text.utf8), fileExtension: "jsonl", rows: documents.count)
     }

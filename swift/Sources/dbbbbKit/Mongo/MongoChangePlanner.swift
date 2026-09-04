@@ -42,6 +42,14 @@ extension MongoUpdatePlan: Equatable {
 /// original value (nulls match only existing nulls), `_id` is required and
 /// immutable, and a zero `matchedCount`/`deletedCount` at apply time means
 /// the document changed or vanished underneath the edit.
+///
+/// `$set` values keep the BSON numeric width of the field they replace:
+/// a double field crosses the display layer as a bare `.number`, so an
+/// integral edit would otherwise be written back as int32 (see
+/// `jsonValue(from:)`), silently changing the field's BSON type. The planner
+/// re-encodes such edits as double. Tagged int32/int64 originals keep their
+/// width; an int32 field only widens to int64 when the new value does not
+/// fit in 32 bits, which is unavoidable.
 enum MongoChangePlanner {
     /// JS-era prototype-pollution guards; record keys still come from a UI
     /// round-trip and are never valid field choices for us.
@@ -136,6 +144,27 @@ enum MongoChangePlanner {
 
     // MARK: - Plans
 
+    /// Re-encodes an edited value so an integral edit cannot silently change a
+    /// double field's BSON type: when the original field is a double (shown as
+    /// a bare `.number`) and the new value is an integral int32/int64, the
+    /// `$set` value stays a double. The conversion is lossless — integral
+    /// display numbers are exactly representable as Double. All other
+    /// combinations (including explicitly tagged `$numberInt`/`$numberLong`
+    /// edits, which this rule deliberately overrides back to double to keep
+    /// the drift fail-safe) pass through unchanged.
+    private static func valuePreservingNumericType(
+        original: BSONValue, current: BSONValue
+    ) -> BSONValue {
+        switch (original, current) {
+        case (.double, .int32(let int)):
+            return .double(Double(int))
+        case (.double, .int64(let int)):
+            return .double(Double(int))
+        default:
+            return current
+        }
+    }
+
     /// Plans one top-level, single-document update. The filter compares every
     /// original field with its original value — the same whole-document
     /// optimistic granularity as deletes and PostgreSQL full-row changes.
@@ -163,7 +192,8 @@ enum MongoChangePlanner {
         for (field, originalValue) in originalEntries where field != "_id" {
             if let currentValue = currentValues[field] {
                 if currentValue != originalValue {
-                    set.append((field, currentValue))
+                    set.append((field, valuePreservingNumericType(
+                        original: originalValue, current: currentValue)))
                 }
             } else {
                 unset.append(field)

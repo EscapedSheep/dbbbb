@@ -8,10 +8,13 @@ import dbbbbCore
 /// passes the fail-closed classifier in `assertSQLiteReadOnlySQL`. Cancellation is
 /// real here — GRDB exposes `sqlite3_interrupt` via `DatabaseQueue.interrupt()`.
 ///
-/// All statements run synchronously on GRDB's serialized writer queue, so a
-/// long query blocks one cooperative-thread-pool thread until it finishes or
-/// is interrupted; `ExecuteOptions.timeout` is accepted for contract parity
-/// but is enforced by the session layer, not here.
+/// The file is not opened at init (adapters are constructed on the main
+/// thread when connections are restored); `DatabaseQueue` creation is
+/// deferred to first use. All statements run synchronously on GRDB's
+/// serialized writer queue, so a long query blocks one cooperative-thread-pool
+/// thread until it finishes or is interrupted; `ExecuteOptions.timeout` is
+/// enforced here by a watchdog that interrupts the queue through the same
+/// mechanism as `cancel(requestID:)`.
 public final class SQLiteAdapter: DatabaseAdapter, Sendable {
     public let profile: ConnectionProfile
 
@@ -46,21 +49,9 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
             throw SQLiteAdapterError("SQLite connection settings are invalid.")
         }
 
-        // Read-only profiles open the file read-only so the SQLite layer
-        // rejects writes even if the SQL classifier has a gap.
-        var configuration = Configuration()
-        configuration.readonly = input.readOnly
-
-        let queue: DatabaseQueue
-        do {
-            queue = try DatabaseQueue(path: input.filePath, configuration: configuration)
-        } catch {
-            throw Self.sanitizedError("Could not open the SQLite database", error, filePath: input.filePath)
-        }
-
         self.filePath = input.filePath
         self.readOnly = input.readOnly
-        self.state = Mutex(State(queue: queue))
+        self.state = Mutex(State())
         self.profile = ConnectionProfile(
             name: input.name,
             engine: .sqlite,
@@ -134,6 +125,30 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
         let queue = try currentQueue()
         let startedAt = Date()
 
+        // The timeout budget is enforced here: once it expires the watchdog
+        // interrupts the queue through the same sqlite3_interrupt path as
+        // cancel(requestID:), and the aborted statement surfaces as a timeout.
+        // `settled` closes the window where a watchdog firing just after the
+        // fetch finished would interrupt the next statement queued behind it.
+        let timeoutState = Mutex((settled: false, fired: false))
+        var watchdog: Task<Void, Never>?
+        if options.timeout > .zero {
+            watchdog = Task {
+                try? await Task.sleep(for: options.timeout)
+                guard !Task.isCancelled else { return }
+                let shouldInterrupt = timeoutState.withLock { state -> Bool in
+                    guard !state.settled else { return false }
+                    state.fired = true
+                    return true
+                }
+                if shouldInterrupt { queue.interrupt() }
+            }
+        }
+        defer {
+            watchdog?.cancel()
+            timeoutState.withLock { $0.settled = true }
+        }
+
         do {
             let fetched = try await queue.read { db in
                 try Self.fetchRows(db: db, sql: sql, options: options)
@@ -147,6 +162,9 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
         } catch let error as SQLiteAdapterError {
             throw error
         } catch {
+            if timeoutState.withLock({ $0.fired }) {
+                throw SQLiteAdapterError("SQLite query timed out.")
+            }
             throw Self.sanitizedError("SQLite query failed", error, filePath: filePath)
         }
     }
@@ -245,7 +263,9 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
 
     // MARK: - Value conversion
 
-    private static func displayValue(for value: DatabaseValue) -> DisplayValue {
+    // Internal (not private) so tests can reach non-finite-double rendering;
+    // SQLite itself folds NaN to NULL, so no SQL round-trip can produce one.
+    static func displayValue(for value: DatabaseValue) -> DisplayValue {
         switch value.storage {
         case .null:
             .null
@@ -258,7 +278,13 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
                 .string(String(int))
             }
         case .double(let double):
-            double.isFinite ? .number(double) : .string(double > 0 ? "Infinity" : "-Infinity")
+            if double.isNaN {
+                .string("NaN")
+            } else if double.isFinite {
+                .number(double)
+            } else {
+                .string(double > 0 ? "Infinity" : "-Infinity")
+            }
         case .string(let string):
             .string(boundedString(string))
         case .blob(let data):
@@ -321,11 +347,23 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
 
     // MARK: - Errors
 
+    // Opening the DatabaseQueue performs file IO, so it happens on first use
+    // rather than at init (which can run on the main thread). Read-only
+    // profiles open the file read-only so the SQLite layer rejects writes
+    // even if the SQL classifier has a gap.
     private func currentQueue() throws -> DatabaseQueue {
         try state.withLock { state in
             if state.closed { throw AdapterError.sessionClosed }
-            guard let queue = state.queue else { throw AdapterError.sessionClosed }
-            return queue
+            if let queue = state.queue { return queue }
+            var configuration = Configuration()
+            configuration.readonly = readOnly
+            do {
+                let queue = try DatabaseQueue(path: filePath, configuration: configuration)
+                state.queue = queue
+                return queue
+            } catch {
+                throw Self.sanitizedError("Could not open the SQLite database", error, filePath: filePath)
+            }
         }
     }
 
@@ -475,10 +513,12 @@ extension SQLiteAdapter: SupportsEditing {
                 let plan: SQLiteParameterizedPlan
                 if let current {
                     plan = try SQLiteChangePlanner.planUpdate(
-                        table: table, primaryKey: primaryKey, original: original, current: current)
+                        table: table, columnTypes: metadata.columnTypes,
+                        primaryKey: primaryKey, original: original, current: current)
                 } else {
                     plan = try SQLiteChangePlanner.planDelete(
-                        table: table, primaryKey: primaryKey, original: original)
+                        table: table, columnTypes: metadata.columnTypes,
+                        primaryKey: primaryKey, original: original)
                 }
 
                 let bindColumns = SQLiteChangeMapper.bindColumns(

@@ -157,6 +157,55 @@ struct MongoChangePlannerTests {
         #expect(plan.filter.contains { $0.key == "added" && $0.value == .document([("$exists", .bool(false))]) })
     }
 
+    // MARK: Numeric BSON type stability
+
+    @Test func updatePlanKeepsDoubleFieldsDoubleWhenEditIsIntegral() throws {
+        // The real edit path: a double field displays as a bare `.number`,
+        // and `bsonValue(from:)` encodes an integral edit as int32 — the
+        // planner must re-encode it as double so the field keeps its type.
+        let edited = try MongoChangePlanner.bsonValue(from: .number(7), label: "d")
+        #expect(edited == .int32(7)) // the drift source, before planning
+        let plan = try MongoChangePlanner.planUpdate(
+            original: [("_id", .objectID(objectID)), ("rating", .double(5.0))],
+            current: [("_id", .objectID(objectID)), ("rating", edited)])
+        #expect(pairsEqual(plan.set, [("rating", .double(7.0))]))
+    }
+
+    @Test func updatePlanKeepsDoubleFieldsDoubleForLargeIntegralEdits() throws {
+        // Beyond the int32 range the edit lands as int64; still re-encode as
+        // double (lossless: display numbers stay within the safe-integer range).
+        let edited = try MongoChangePlanner.bsonValue(from: .number(3_000_000_000), label: "d")
+        #expect(edited == .int64(3_000_000_000))
+        let plan = try MongoChangePlanner.planUpdate(
+            original: [("_id", .int32(1)), ("v", .double(0.5))],
+            current: [("_id", .int32(1)), ("v", edited)])
+        #expect(pairsEqual(plan.set, [("v", .double(3_000_000_000))]))
+    }
+
+    @Test func updatePlanKeepsInt32FieldsInt32() throws {
+        // A tagged-width original never narrows/drifts: int32 stays int32.
+        let plan = try MongoChangePlanner.planUpdate(
+            original: [("_id", .int32(1)), ("count", .int32(4))],
+            current: [("_id", .int32(1)), ("count", .int32(9))])
+        #expect(pairsEqual(plan.set, [("count", .int32(9))]))
+    }
+
+    @Test func updatePlanWidensInt32OnlyWhenValueExceedsInt32() throws {
+        // Necessary drift: the new value does not fit in 32 bits, so int64 is
+        // the narrowest faithful encoding; the planner must NOT coerce it back.
+        let plan = try MongoChangePlanner.planUpdate(
+            original: [("_id", .int32(1)), ("count", .int32(4))],
+            current: [("_id", .int32(1)), ("count", .int64(3_000_000_000))])
+        #expect(pairsEqual(plan.set, [("count", .int64(3_000_000_000))]))
+    }
+
+    @Test func updatePlanKeepsInt64FieldsInt64() throws {
+        let plan = try MongoChangePlanner.planUpdate(
+            original: [("_id", .int32(1)), ("big", .int64(9_007_199_254_740_993))],
+            current: [("_id", .int32(1)), ("big", .int64(9_007_199_254_740_992))])
+        #expect(pairsEqual(plan.set, [("big", .int64(9_007_199_254_740_992))]))
+    }
+
     @Test func updatePlanValidation() {
         let id: MongoFieldEntry = ("_id", .int32(1))
         assertPlanThrows(containing: "requires _id in both documents") {

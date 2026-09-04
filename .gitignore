@@ -9,3 +9,7 @@ coverage/
 .vscode/
 swift/.build/
 swift/release/
+swift/.swiftpm/
+DerivedData/
+*.xcuserstate
+HANDOVER.md

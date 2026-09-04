@@ -121,8 +121,9 @@ enum MySQLValueMapping {
         }
     }
 
-    /// Applies the row-count and byte budgets. MySQLNIO materializes the full
-    /// result, so `rawRows.count > maxRows` already proves truncation.
+    /// Applies the row-count and byte budgets. The text-query command keeps at
+    /// most maxRows + 1 rows, so `rawRows.count > maxRows` already proves
+    /// truncation.
     static func boundedRows(
         rawRows: [MySQLRow],
         maxRows: Int,

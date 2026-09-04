@@ -246,6 +246,87 @@ final class SQLiteEditingTests: XCTestCase {
         }
     }
 
+    /// Byte-level lock proof against real SQLite collation semantics: under a
+    /// `NOCASE`/`RTRIM` column a concurrent case- or trailing-space-only
+    /// rewrite must surface as an optimistic-concurrency conflict, while the
+    /// unchanged row still edits cleanly.
+    func testCollationInsensitiveRewriteConflicts() async throws {
+        let path = try makeDatabase(sql: """
+            CREATE TABLE ci (
+                id INTEGER PRIMARY KEY,
+                code TEXT COLLATE NOCASE,
+                padded TEXT COLLATE RTRIM
+            );
+            INSERT INTO ci VALUES (1, 'ABC', 'pad'), (2, 'keep', 'keep');
+            """)
+        let adapter = try makeAdapter(path: path)
+        let table = target(named: "ci")
+        let original = try await previewedRecord(adapter, table: table, id: 1)
+        XCTAssertEqual(original["code"], .string("ABC"))
+        XCTAssertEqual(original["padded"], .string("pad"))
+
+        // External writes go through a separate connection, like a concurrent
+        // session of another client.
+        let external = try DatabaseQueue(path: path)
+        func externalWrite(_ sql: String) throws {
+            try external.write { db in try db.execute(sql: sql) }
+        }
+
+        // Control: the untouched row edits cleanly under the byte-level lock.
+        _ = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: original,
+            operation: .update(changed: ["code": .string("abc")])))
+        let edited = try rows(try await adapter.execute(
+            .sql("SELECT code FROM ci WHERE id = 1"), options: ExecuteOptions()))
+        XCTAssertEqual(edited.rows.first?.first, .string("abc"))
+
+        // A concurrent case-only rewrite (invisible to NOCASE) must conflict.
+        let staleNocase = try await previewedRecord(adapter, table: table, id: 1)
+        try externalWrite("UPDATE ci SET code = 'ABC' WHERE id = 1")
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table,
+                original: staleNocase,
+                operation: .update(changed: ["code": .string("touched")])))
+            XCTFail("case-only rewrite under NOCASE must conflict")
+        } catch let error as SQLiteAdapterError {
+            XCTAssertTrue(error.userMessage.contains("optimistic-concurrency conflict"),
+                          error.userMessage)
+        }
+
+        // A concurrent trailing-space rewrite (invisible to RTRIM) must conflict.
+        try externalWrite("UPDATE ci SET padded = 'pad  ' WHERE id = 1")
+        let staleRtrim = try await previewedRecord(adapter, table: table, id: 1)
+        XCTAssertEqual(staleRtrim["padded"], .string("pad  "))
+        try externalWrite("UPDATE ci SET padded = 'pad' WHERE id = 1")
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table,
+                original: staleRtrim,
+                operation: .update(changed: ["padded": .string("touched")])))
+            XCTFail("trailing-space rewrite under RTRIM must conflict")
+        } catch let error as SQLiteAdapterError {
+            XCTAssertTrue(error.userMessage.contains("optimistic-concurrency conflict"),
+                          error.userMessage)
+        }
+
+        // Deletes are byte-exact too: a stale delete after a case-only
+        // rewrite conflicts instead of deleting the changed row.
+        try externalWrite("UPDATE ci SET code = 'aBc' WHERE id = 1")
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table, original: staleNocase, operation: .delete))
+            XCTFail("stale delete under NOCASE must conflict")
+        } catch let error as SQLiteAdapterError {
+            XCTAssertTrue(error.userMessage.contains("optimistic-concurrency conflict"),
+                          error.userMessage)
+        }
+        let remaining = try rows(try await adapter.execute(
+            .sql("SELECT code FROM ci ORDER BY id"), options: ExecuteOptions()))
+        XCTAssertEqual(remaining.rows.map { $0[0] }, [.string("aBc"), .string("keep")])
+    }
+
     func testRejectsReadOnlySessions() async throws {
         let path = try makeDatabase(sql: """
             CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT);

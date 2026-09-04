@@ -9,9 +9,11 @@ struct RowModel: Identifiable {
     var cells: [String] { values.map(DisplayFormatting.cellText) }
 }
 
-/// One node in the monospaced document tree (MongoDB results).
+/// One node in the monospaced document tree (MongoDB results). `id` is
+/// derived from the document path, so rebuilding the tree for a new result
+/// keeps identities stable and SwiftUI retains expansion state.
 struct DocNode: Identifiable {
-    let id = UUID()
+    let id: String
     let label: String
     let valueText: String?
     let isNull: Bool
@@ -20,20 +22,28 @@ struct DocNode: Identifiable {
     let documentIndex: Int?
 
     static func make(label: String, value: DisplayValue, documentIndex: Int? = nil) -> DocNode {
+        make(id: label, label: label, value: value, documentIndex: documentIndex)
+    }
+
+    private static func make(id: String, label: String, value: DisplayValue, documentIndex: Int? = nil) -> DocNode {
         switch value {
         case .object(let pairs):
-            DocNode(label: label, valueText: nil, isNull: false,
-                    children: pairs.map { make(label: $0.key, value: $0.value) },
+            DocNode(id: id, label: label, valueText: nil, isNull: false,
+                    children: pairs.enumerated().map {
+                        make(id: "\(id)/\($0.offset)", label: $0.element.key, value: $0.element.value)
+                    },
                     documentIndex: documentIndex)
         case .array(let items):
-            DocNode(label: label, valueText: nil, isNull: false,
-                    children: items.enumerated().map { make(label: "[\($0.offset)]", value: $0.element) },
+            DocNode(id: id, label: label, valueText: nil, isNull: false,
+                    children: items.enumerated().map {
+                        make(id: "\(id)/\($0.offset)", label: "[\($0.offset)]", value: $0.element)
+                    },
                     documentIndex: documentIndex)
         case .null:
-            DocNode(label: label, valueText: "null", isNull: true, children: nil,
+            DocNode(id: id, label: label, valueText: "null", isNull: true, children: nil,
                     documentIndex: documentIndex)
         default:
-            DocNode(label: label, valueText: DisplayFormatting.cellText(value), isNull: false,
+            DocNode(id: id, label: label, valueText: DisplayFormatting.cellText(value), isNull: false,
                     children: nil, documentIndex: documentIndex)
         }
     }

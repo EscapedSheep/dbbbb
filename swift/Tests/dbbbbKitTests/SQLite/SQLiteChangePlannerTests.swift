@@ -26,6 +26,10 @@ final class SQLiteChangePlannerTests: XCTestCase {
     func testCompositeKeyUpdateIsParameterizedWithNullSafePredicates() throws {
         let plan = try SQLiteChangePlanner.planUpdate(
             table: "order\"line",
+            columnTypes: [
+                "tenant_id": "BIGINT", "id": "INTEGER",
+                "status": "TEXT", "note": "VARCHAR(20)", "unchanged": "INTEGER",
+            ],
             primaryKey: [("tenant_id", .number(7)), ("id", .string("order-1"))],
             original: [("status", .string("draft")), ("note", .null), ("unchanged", .number(4))],
             current: [("status", .string("paid")), ("note", .string("ready")), ("unchanged", .number(4))])
@@ -36,8 +40,8 @@ final class SQLiteChangePlannerTests: XCTestCase {
             "    \"note\" = ?",
             "WHERE \"tenant_id\" IS ?",
             "  AND \"id\" IS ?",
-            "  AND \"status\" IS ?",
-            "  AND \"note\" IS ?",
+            "  AND \"status\" IS ? COLLATE BINARY",
+            "  AND \"note\" IS ? COLLATE BINARY",
             "  AND \"unchanged\" IS ?",
         ].joined(separator: "\n"))
         XCTAssertEqual(plan.values, [
@@ -50,13 +54,14 @@ final class SQLiteChangePlannerTests: XCTestCase {
     func testDeleteMatchesIdentityAndOriginalValues() throws {
         let plan = try SQLiteChangePlanner.planDelete(
             table: "users",
+            columnTypes: ["id": "INTEGER", "email": "TEXT", "active": "BOOLEAN"],
             primaryKey: [("id", .number(42))],
             original: [("id", .number(42)), ("email", .string("before@example.test")), ("active", .bool(true))])
 
         XCTAssertEqual(plan.text, [
             "DELETE FROM \"users\"",
             "WHERE \"id\" IS ?",
-            "  AND \"email\" IS ?",
+            "  AND \"email\" IS ? COLLATE BINARY",
             "  AND \"active\" IS ?",
         ].joined(separator: "\n"))
         XCTAssertEqual(plan.values, [.number(42), .string("before@example.test"), .bool(true)])
@@ -66,6 +71,7 @@ final class SQLiteChangePlannerTests: XCTestCase {
         let hostileValue = "x'); DROP TABLE audit; --"
         let plan = try SQLiteChangePlanner.planUpdate(
             table: "users\"; DROP TABLE audit; --",
+            columnTypes: ["id": "INTEGER", "display_name": "TEXT"],
             primaryKey: [("id", .number(1))],
             original: [("display_name", .string("before"))],
             current: [("display_name", .string(hostileValue))])
@@ -79,28 +85,28 @@ final class SQLiteChangePlannerTests: XCTestCase {
     func testRejectsMissingIdentityEmptyPatchesAndPrimaryKeyEdits() {
         assertPlanThrows(containing: "primary-key") {
             try SQLiteChangePlanner.planUpdate(
-                table: "users",
+                table: "users", columnTypes: [:],
                 primaryKey: [],
                 original: [("name", .string("before"))],
                 current: [("name", .string("after"))])
         }
         assertPlanThrows(containing: "original values") {
             try SQLiteChangePlanner.planUpdate(
-                table: "users",
+                table: "users", columnTypes: [:],
                 primaryKey: [("id", .number(1))],
                 original: [],
                 current: [])
         }
         assertPlanThrows(containing: "changed value") {
             try SQLiteChangePlanner.planUpdate(
-                table: "users",
+                table: "users", columnTypes: [:],
                 primaryKey: [("id", .number(1))],
                 original: [("name", .string("same"))],
                 current: [("name", .string("same"))])
         }
         assertPlanThrows(containing: "cannot be edited") {
             try SQLiteChangePlanner.planUpdate(
-                table: "users",
+                table: "users", columnTypes: [:],
                 primaryKey: [("id", .number(1))],
                 original: [("id", .number(1)), ("name", .string("before"))],
                 current: [("id", .number(2)), ("name", .string("before"))])
@@ -110,33 +116,33 @@ final class SQLiteChangePlannerTests: XCTestCase {
     func testRejectsAmbiguousPatchesAndDangerousKeys() {
         assertPlanThrows(containing: "same columns") {
             try SQLiteChangePlanner.planUpdate(
-                table: "users",
+                table: "users", columnTypes: [:],
                 primaryKey: [("id", .number(1))],
                 original: [("first_name", .string("before"))],
                 current: [("display_name", .string("after"))])
         }
         assertPlanThrows(containing: "dangerous key") {
             try SQLiteChangePlanner.planUpdate(
-                table: "users",
+                table: "users", columnTypes: [:],
                 primaryKey: [("id", .number(1))],
                 original: [("__proto__", .string("value"))],
                 current: [("__proto__", .string("value2"))])
         }
         assertPlanThrows(containing: "cannot be null") {
             try SQLiteChangePlanner.planDelete(
-                table: "users",
+                table: "users", columnTypes: [:],
                 primaryKey: [("id", .null)],
                 original: [("id", .null)])
         }
         assertPlanThrows(containing: "inconsistent") {
             try SQLiteChangePlanner.planDelete(
-                table: "users",
+                table: "users", columnTypes: [:],
                 primaryKey: [("id", .number(1))],
                 original: [("id", .number(2))])
         }
         assertPlanThrows(containing: "invalid field name") {
             try SQLiteChangePlanner.planDelete(
-                table: "users",
+                table: "users", columnTypes: [:],
                 primaryKey: [("id", .number(1))],
                 original: [("bad\u{0}name", .number(1))])
         }
@@ -145,6 +151,72 @@ final class SQLiteChangePlannerTests: XCTestCase {
     func testQuoteIdentifierRejectsEmptyAndNUL() {
         XCTAssertThrowsError(try SQLiteChangePlanner.quoteIdentifier(""))
         XCTAssertThrowsError(try SQLiteChangePlanner.quoteIdentifier("a\u{0}b"))
+    }
+
+    // MARK: - Byte-level optimistic matching
+
+    /// TEXT-affinity declared types compare bytes via `COLLATE BINARY` on the
+    /// bound value; other affinities already compare storage classes exactly.
+    /// Affinity follows SQLite's documented rules (INT wins over CHAR).
+    func testTextAffinityColumnsUseCollationBinary() throws {
+        let plan = try SQLiteChangePlanner.planDelete(
+            table: "users",
+            columnTypes: [
+                "id": "INTEGER",
+                "name": "TEXT", "nick": "VARCHAR(20)", "blob_text": "CLOB",
+                "weird": "POINT",  // contains INT → INTEGER affinity
+                "score": "REAL", "flag": "BOOLEAN",  // NUMERIC affinity
+                "payload": "BLOB", "raw": "",
+            ],
+            primaryKey: [("id", .number(1))],
+            original: [
+                ("id", .number(1)),
+                ("name", .string("n")), ("nick", .string("k")), ("blob_text", .string("c")),
+                ("weird", .number(2)), ("score", .number(1.5)), ("flag", .bool(true)),
+                ("payload", .binary(Data([0xDE]))), ("raw", .string("r")),
+            ])
+
+        for column in ["name", "nick", "blob_text"] {
+            XCTAssertTrue(
+                plan.text.contains("AND \"\(column)\" IS ? COLLATE BINARY"),
+                "\(column) must compare bytes: \(plan.text)")
+        }
+        for column in ["weird", "score", "flag", "payload", "raw"] {
+            XCTAssertTrue(
+                plan.text.contains("AND \"\(column)\" IS ?\n")
+                    || plan.text.contains("AND \"\(column)\" IS ?"),
+                "\(column) must keep native comparison: \(plan.text)")
+            XCTAssertFalse(
+                plan.text.contains("\"\(column)\" IS ? COLLATE BINARY"),
+                "\(column) must not be byte-compared: \(plan.text)")
+        }
+    }
+
+    /// Byte comparison is decided by column affinity: NULL values and
+    /// primary-key columns under TEXT affinity still compare bytes, `IS`
+    /// stays NULL-safe, and bind order is unchanged.
+    func testCollationBinaryIsColumnDrivenAndNullSafe() throws {
+        let plan = try SQLiteChangePlanner.planUpdate(
+            table: "users",
+            columnTypes: ["code": "TEXT COLLATE NOCASE", "note": "TEXT", "rank": "INTEGER"],
+            primaryKey: [("code", .string("ABC"))],
+            original: [("code", .string("ABC")), ("note", .null), ("rank", .number(3))],
+            current: [("code", .string("ABC")), ("note", .string("x")), ("rank", .number(3))])
+
+        XCTAssertTrue(plan.text.contains("WHERE \"code\" IS ? COLLATE BINARY"))
+        XCTAssertTrue(plan.text.contains("AND \"note\" IS ? COLLATE BINARY"))
+        XCTAssertTrue(plan.text.contains("AND \"rank\" IS ?"))
+        XCTAssertEqual(plan.values, [.string("x"), .string("ABC"), .null, .number(3)])
+    }
+
+    /// Columns missing from the type map keep native comparison rather than
+    /// failing planning (the adapter always passes complete metadata).
+    func testUnknownColumnTypeKeepsNativeEquality() throws {
+        let plan = try SQLiteChangePlanner.planDelete(
+            table: "users", columnTypes: [:],
+            primaryKey: [("id", .number(1))],
+            original: [("id", .number(1)), ("note", .string("x"))])
+        XCTAssertTrue(plan.text.contains("AND \"note\" IS ?"))
     }
 
     // MARK: - Metadata validation

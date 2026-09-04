@@ -40,8 +40,11 @@ public struct MySQLChangePlanError: dbbbbError, Equatable {
 /// Mirrors `PostgresChangePlanner` — itself ported from
 /// `src/main/editing/change-planner.ts` — with MySQL semantics: every
 /// `UPDATE`/`DELETE` is parameterized and matches the primary key plus *all*
-/// original column values with the NULL-safe `<=>` operator. MySQL has no
-/// `RETURNING`; the adapter detects conflicts through the OK packet's
+/// original column values with the NULL-safe `<=>` operator. String-family
+/// columns are matched byte-for-byte through the `BINARY` cast, because the
+/// column's own collation (default `utf8mb4_0900_ai_ci`) would equate
+/// case/accent/trailing-space variants and miss a concurrent change. MySQL
+/// has no `RETURNING`; the adapter detects conflicts through the OK packet's
 /// affected-row count (zero rows = the row changed or vanished underneath
 /// the edit).
 public enum MySQLChangePlanner {
@@ -60,6 +63,19 @@ public enum MySQLChangePlanner {
         "bit",
         "geometry", "point", "linestring", "polygon",
         "multipoint", "multilinestring", "multipolygon", "geometrycollection",
+    ]
+
+    /// Lowercased `DATA_TYPE` names whose comparisons follow the column
+    /// collation. Under a case/accent-insensitive collation a concurrent
+    /// transaction that only changes letter case, accents, or trailing
+    /// spaces would stay invisible to the optimistic lock, so these columns
+    /// are compared byte-for-byte via the `BINARY` cast instead. The binary
+    /// family (blob/binary) already compares bytes, and fixed-scale decimal
+    /// stores a canonical rendering per value, so neither needs the cast.
+    public static let byteComparedTypeNames: Set<String> = [
+        "char", "varchar",
+        "tinytext", "text", "mediumtext", "longtext",
+        "enum", "set",
     ]
 
     /// Introspection query for the change-target metadata (used by the editing
@@ -219,6 +235,7 @@ public enum MySQLChangePlanner {
 
     private static func appendWhere(
         values: inout [DisplayValue],
+        columnTypes: [String: String],
         primaryKey: [MySQLFieldEntry],
         original: [MySQLFieldEntry]
     ) throws -> String {
@@ -227,22 +244,36 @@ public enum MySQLChangePlanner {
 
         for (column, value) in primaryKey {
             values.append(value)
-            try conditions.append("\(quoteIdentifier(column)) <=> ?")
+            try conditions.append(equality(column: column, columnTypes: columnTypes))
         }
         for (column, value) in original where !keyColumns.contains(column) {
             values.append(value)
-            try conditions.append("\(quoteIdentifier(column)) <=> ?")
+            try conditions.append(equality(column: column, columnTypes: columnTypes))
         }
         return conditions.joined(separator: "\n  AND ")
+    }
+
+    /// The NULL-safe optimistic-lock predicate for one column. String-family
+    /// columns compare bytes (`BINARY` on both sides; `<=>` stays NULL-safe
+    /// under the cast); everything else compares natively.
+    private static func equality(column: String, columnTypes: [String: String]) throws -> String {
+        let quoted = try quoteIdentifier(column)
+        if let type = columnTypes[column], byteComparedTypeNames.contains(type) {
+            return "BINARY \(quoted) <=> BINARY ?"
+        }
+        return "\(quoted) <=> ?"
     }
 
     // MARK: - Plans
 
     /// Plans one optimistic row update. `original` and `current` must contain
     /// the same columns; only values that actually changed are assigned.
+    /// `columnTypes` (lowercased `DATA_TYPE` per column, from the change
+    /// metadata) selects byte-level matching for string-family columns.
     public static func planUpdate(
         database: String,
         table: String,
+        columnTypes: [String: String],
         primaryKey: [MySQLFieldEntry],
         original: [MySQLFieldEntry],
         current: [MySQLFieldEntry]
@@ -278,7 +309,8 @@ public enum MySQLChangePlanner {
         }
         var whereValues = values
         let whereClause = try appendWhere(
-            values: &whereValues, primaryKey: target.primaryKey, original: target.original)
+            values: &whereValues, columnTypes: columnTypes,
+            primaryKey: target.primaryKey, original: target.original)
 
         return MySQLParameterizedPlan(
             text: [
@@ -289,10 +321,13 @@ public enum MySQLChangePlanner {
             values: whereValues)
     }
 
-    /// Plans one optimistic row delete without executing it.
+    /// Plans one optimistic row delete without executing it. `columnTypes`
+    /// selects byte-level matching for string-family columns, as in
+    /// `planUpdate`.
     public static func planDelete(
         database: String,
         table: String,
+        columnTypes: [String: String],
         primaryKey: [MySQLFieldEntry],
         original: [MySQLFieldEntry]
     ) throws -> MySQLParameterizedPlan {
@@ -300,7 +335,8 @@ public enum MySQLChangePlanner {
             database: database, table: table, primaryKey: primaryKey, original: original)
         var values: [DisplayValue] = []
         let whereClause = try appendWhere(
-            values: &values, primaryKey: target.primaryKey, original: target.original)
+            values: &values, columnTypes: columnTypes,
+            primaryKey: target.primaryKey, original: target.original)
 
         return MySQLParameterizedPlan(
             text: [

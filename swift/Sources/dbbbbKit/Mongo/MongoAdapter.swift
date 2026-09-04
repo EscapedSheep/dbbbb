@@ -209,6 +209,8 @@ public final class MongoAdapter: DatabaseAdapter, Sendable {
 
         let startedAt = ContinuousClock.now
         let watchdog = Task { [requestState, timeout = options.timeout] in
+            // A non-positive timeout means no timeout, as on the other engines.
+            guard timeout > .zero else { return }
             try? await Task.sleep(for: timeout)
             guard !Task.isCancelled else { return }
             requestState.fireTimeout()
@@ -389,10 +391,13 @@ public final class MongoAdapter: DatabaseAdapter, Sendable {
         return base + "?" + parameters.joined(separator: "&")
     }
 
+    /// maxTimeMS for a timeout budget. A non-positive budget maps to 0, the
+    /// server's "no limit" sentinel — matching the disabled-timeout semantics
+    /// of the other engines.
     static func timeoutMilliseconds(_ duration: Duration) -> Int64 {
         let components = duration.components
         let millis = components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000
-        return max(1, min(millis, Int64(Int32.max)))
+        return max(0, min(millis, Int64(Int32.max)))
     }
 
     // MARK: - Object identifiers

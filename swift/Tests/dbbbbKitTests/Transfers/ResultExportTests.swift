@@ -76,9 +76,49 @@ final class ResultExportTests: XCTestCase {
         }
     }
 
+    // MARK: - CSV formula-injection neutralization
+
+    func testCSVExportNeutralizesFormulaCellsAndHeaders() throws {
+        let result = QueryResult.rows(
+            columns: columns(["=cmd", "name"]),
+            rows: [
+                [.string("=HYPERLINK(\"http://evil\")"), .string("+1+2")],
+                [.string("-2+3"), .string("@SUM(1)")],
+            ],
+            meta: meta)
+        let exported = try ResultExporter.exportData(for: result)
+        XCTAssertEqual(
+            String(decoding: exported.data, as: UTF8.self),
+            "'=cmd,name\r\n"
+                + "\"'=HYPERLINK(\"\"http://evil\"\")\",'+1+2\r\n"
+                + "'-2+3,'@SUM(1)\r\n")
+    }
+
+    func testCSVExportNeutralizationLeavesOtherCellsAlone() throws {
+        let result = QueryResult.rows(
+            columns: columns(["plain", "n"]),
+            rows: [
+                // Null, empty string, numbers, and ordinary text are untouched
+                // (a numeric -4 must not gain a quote; only strings do).
+                [.null, .number(-4)],
+                [.string(""), .number(2.5)],
+                [.string("safe text"), .bool(true)],
+                [.string("=already"), .string(" '=-prefixed")],
+            ],
+            meta: meta)
+        let exported = try ResultExporter.exportData(for: result)
+        XCTAssertEqual(
+            String(decoding: exported.data, as: UTF8.self),
+            "plain,n\r\n"
+                + ",-4\r\n"
+                + ",2.5\r\n"
+                + "safe text,true\r\n"
+                + "'=already, '=-prefixed\r\n")
+    }
+
     // MARK: - JSONL export
 
-    func testJSONLExportCanonicalDocuments() throws {
+    func testJSONLExportCanonicalEJSONDocuments() throws {
         let result = QueryResult.documents(
             [
                 .object([
@@ -93,9 +133,11 @@ final class ResultExportTests: XCTestCase {
         let exported = try ResultExporter.exportData(for: result)
         XCTAssertEqual(exported.fileExtension, "jsonl")
         XCTAssertEqual(exported.rows, 2)
+        // Canonical EJSON: original key order (no sorting), bare numbers as
+        // $numberDouble so BSON doubles survive a re-import.
         XCTAssertEqual(
             String(decoding: exported.data, as: UTF8.self),
-            "{\"_id\":\"abc123\",\"price\":\"19.99\",\"tags\":[\"a\",3],\"title\":\"café\"}\n"
+            "{\"title\":\"café\",\"price\":\"19.99\",\"tags\":[\"a\",{\"$numberDouble\":\"3.0\"}],\"_id\":\"abc123\"}\n"
                 + "{\"n\":false}\n")
     }
 

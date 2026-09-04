@@ -50,12 +50,12 @@ actor MySQLAdapterState {
         executions[requestID]?.threadID = threadID
     }
 
-    /// Pre-registers cancellation. Returns the thread id to kill when the query
-    /// is already running; otherwise the next cancellation checkpoint catches it.
+    /// Pre-registers cancellation, even for a request that has not started
+    /// yet; execute checks the set before touching the pool. Returns the
+    /// thread id to kill when the query is already running.
     func cancel(requestID: UUID) -> UInt64? {
-        guard let execution = executions[requestID] else { return nil }
         cancelledRequestIDs.insert(requestID)
-        return execution.threadID
+        return executions[requestID]?.threadID
     }
 
     /// Marks the request timed out; returns the thread id to kill if running.
@@ -236,13 +236,13 @@ public final class MySQLAdapter: DatabaseAdapter {
         try await state.begin(requestID: options.requestID)
 
         let startedAt = ContinuousClock.now
+        let maxRows = max(1, options.maxRows)
         do {
-            let result = try await performQuery(sql: sql, options: options)
+            let result = try await performQuery(sql: sql, options: options, rowLimit: maxRows + 1)
             let outcome = await state.finish(requestID: options.requestID)
             if outcome.timedOut { throw MySQLAdapterError.timedOut }
             if outcome.cancelled { throw MySQLAdapterError.cancelled }
 
-            let maxRows = max(1, options.maxRows)
             let maxBytes = max(1, options.maxBytes)
             let bounded = MySQLValueMapping.boundedRows(
                 rawRows: result.rows,
@@ -307,7 +307,7 @@ public final class MySQLAdapter: DatabaseAdapter {
         }
     }
 
-    private func performQuery(sql: String, options: ExecuteOptions) async throws -> MySQLTextQueryResult {
+    private func performQuery(sql: String, options: ExecuteOptions, rowLimit: Int) async throws -> MySQLTextQueryResult {
         if await state.isCancelled(options.requestID) {
             throw MySQLAdapterError.cancelled
         }
@@ -340,7 +340,7 @@ public final class MySQLAdapter: DatabaseAdapter {
         defer { timeoutTask.cancel() }
 
         do {
-            let result = try await lease.connection.textQuery(sql).get()
+            let result = try await lease.connection.textQuery(sql, rowLimit: rowLimit).get()
             await pool.checkin(lease, healthy: true)
             return result
         } catch {
@@ -589,11 +589,11 @@ extension MySQLAdapter: SupportsEditing {
             let plan: MySQLParameterizedPlan
             if let current {
                 plan = try MySQLChangePlanner.planUpdate(
-                    database: ref.database, table: name,
+                    database: ref.database, table: name, columnTypes: metadata.columnTypes,
                     primaryKey: primaryKey, original: original, current: current)
             } else {
                 plan = try MySQLChangePlanner.planDelete(
-                    database: ref.database, table: name,
+                    database: ref.database, table: name, columnTypes: metadata.columnTypes,
                     primaryKey: primaryKey, original: original)
             }
 

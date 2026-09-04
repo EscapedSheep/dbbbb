@@ -41,9 +41,12 @@ public struct SQLiteChangePlanError: dbbbbError, Equatable {
 /// Pure planner for safe single-row SQLite changes (optimistic concurrency).
 /// Mirrors `PostgresChangePlanner` with SQLite semantics: every
 /// `UPDATE`/`DELETE` is parameterized and matches the primary key plus *all*
-/// original column values with the NULL-safe `IS` operator. The adapter
-/// detects conflicts through `changes()`: zero changed rows means the row
-/// changed or vanished underneath the edit.
+/// original column values with the NULL-safe `IS` operator. TEXT-affinity
+/// columns match with an explicit `COLLATE BINARY` on the bound value,
+/// because the column's declared collation (`NOCASE`/`RTRIM`) would equate
+/// case/accent/trailing-space variants and miss a concurrent change. The
+/// adapter detects conflicts through `changes()`: zero changed rows means
+/// the row changed or vanished underneath the edit.
 ///
 /// Unlike PostgreSQL/MySQL there is no type-refusal list: SQLite values are
 /// one of four storage classes (INTEGER/REAL/TEXT/BLOB), and every display
@@ -193,6 +196,7 @@ public enum SQLiteChangePlanner {
 
     private static func appendWhere(
         values: inout [DisplayValue],
+        columnTypes: [String: String],
         primaryKey: [SQLiteFieldEntry],
         original: [SQLiteFieldEntry]
     ) throws -> String {
@@ -201,21 +205,46 @@ public enum SQLiteChangePlanner {
 
         for (column, value) in primaryKey {
             values.append(value)
-            try conditions.append("\(quoteIdentifier(column)) IS ?")
+            try conditions.append(equality(column: column, columnTypes: columnTypes))
         }
         for (column, value) in original where !keyColumns.contains(column) {
             values.append(value)
-            try conditions.append("\(quoteIdentifier(column)) IS ?")
+            try conditions.append(equality(column: column, columnTypes: columnTypes))
         }
         return conditions.joined(separator: "\n  AND ")
+    }
+
+    /// The NULL-safe optimistic-lock predicate for one column. TEXT-affinity
+    /// columns compare bytes via an explicit `COLLATE BINARY` on the bound
+    /// value, overriding the column's declared collation (`IS` stays
+    /// NULL-safe); other affinities compare storage classes exactly already.
+    private static func equality(column: String, columnTypes: [String: String]) throws -> String {
+        let quoted = try quoteIdentifier(column)
+        if let type = columnTypes[column], isTextAffinity(type) {
+            return "\(quoted) IS ? COLLATE BINARY"
+        }
+        return "\(quoted) IS ?"
+    }
+
+    /// SQLite's TEXT-affinity rule on the uppercased declared type: INTEGER
+    /// affinity wins when the type contains INT, otherwise CHAR/CLOB/TEXT
+    /// make it TEXT affinity.
+    private static func isTextAffinity(_ declaredType: String) -> Bool {
+        !declaredType.contains("INT")
+            && (declaredType.contains("CHAR")
+                || declaredType.contains("CLOB")
+                || declaredType.contains("TEXT"))
     }
 
     // MARK: - Plans
 
     /// Plans one optimistic row update. `original` and `current` must contain
     /// the same columns; only values that actually changed are assigned.
+    /// `columnTypes` (uppercased declared types, from the change metadata)
+    /// selects byte-level matching for TEXT-affinity columns.
     public static func planUpdate(
         table: String,
+        columnTypes: [String: String],
         primaryKey: [SQLiteFieldEntry],
         original: [SQLiteFieldEntry],
         current: [SQLiteFieldEntry]
@@ -250,7 +279,8 @@ public enum SQLiteChangePlanner {
         }
         var whereValues = values
         let whereClause = try appendWhere(
-            values: &whereValues, primaryKey: target.primaryKey, original: target.original)
+            values: &whereValues, columnTypes: columnTypes,
+            primaryKey: target.primaryKey, original: target.original)
 
         return SQLiteParameterizedPlan(
             text: [
@@ -261,16 +291,20 @@ public enum SQLiteChangePlanner {
             values: whereValues)
     }
 
-    /// Plans one optimistic row delete without executing it.
+    /// Plans one optimistic row delete without executing it. `columnTypes`
+    /// selects byte-level matching for TEXT-affinity columns, as in
+    /// `planUpdate`.
     public static func planDelete(
         table: String,
+        columnTypes: [String: String],
         primaryKey: [SQLiteFieldEntry],
         original: [SQLiteFieldEntry]
     ) throws -> SQLiteParameterizedPlan {
         let target = try target(table: table, primaryKey: primaryKey, original: original)
         var values: [DisplayValue] = []
         let whereClause = try appendWhere(
-            values: &values, primaryKey: target.primaryKey, original: target.original)
+            values: &values, columnTypes: columnTypes,
+            primaryKey: target.primaryKey, original: target.original)
 
         return SQLiteParameterizedPlan(
             text: [

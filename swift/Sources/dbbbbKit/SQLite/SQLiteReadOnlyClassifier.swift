@@ -15,10 +15,14 @@ public struct SQLiteAdapterError: dbbbbError, Equatable {
 /// alone is not enough and PRAGMA is never allowed through.
 private let allowedReadOnlyStarters: Set<String> = ["EXPLAIN", "SELECT", "WITH"]
 
+// END and REPLACE are deliberately absent: END legally closes a CASE
+// expression and REPLACE is the replace() string function. Their statement
+// forms (END [TRANSACTION], REPLACE INTO) are rejected because neither is an
+// allowed starter, and an END that closes no CASE is rejected below.
 private let forbiddenReadOnlyTokens: Set<String> = [
     "ALTER", "ANALYZE", "ATTACH", "BEGIN", "COMMIT", "CREATE", "DELETE",
-    "DETACH", "DROP", "END", "INSERT", "PRAGMA", "REINDEX", "RELEASE",
-    "REPLACE", "ROLLBACK", "SAVEPOINT", "TRANSACTION", "UPDATE", "VACUUM",
+    "DETACH", "DROP", "INSERT", "PRAGMA", "REINDEX", "RELEASE",
+    "ROLLBACK", "SAVEPOINT", "TRANSACTION", "UPDATE", "VACUUM",
 ]
 
 // Strips comments (-- and /* */) and quoted literals/identifiers, then
@@ -131,5 +135,22 @@ func assertSQLiteReadOnlySQL(_ sql: String) throws {
     }
     if let forbidden = tokens.first(where: { forbiddenReadOnlyTokens.contains($0) || $0.hasPrefix("PRAGMA_") }) {
         throw SQLiteAdapterError("Read-only connections do not allow the SQL token \(forbidden).")
+    }
+    // END is legal only as the closing keyword of a CASE expression; an END
+    // with no open CASE is the transaction statement (a COMMIT synonym) or
+    // malformed input, so it stays rejected.
+    var openCases = 0
+    for token in tokens {
+        switch token {
+        case "CASE":
+            openCases += 1
+        case "END":
+            guard openCases > 0 else {
+                throw SQLiteAdapterError("Read-only connections do not allow the SQL token END.")
+            }
+            openCases -= 1
+        default:
+            break
+        }
     }
 }

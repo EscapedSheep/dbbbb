@@ -7,11 +7,13 @@ import dbbbbCore
 public enum KeychainStoreError: dbbbbError, Equatable {
     case readFailed
     case writeFailed
+    case removeFailed
 
     public var userMessage: String {
         switch self {
         case .readFailed: "A saved credential could not be read from the Keychain."
         case .writeFailed: "The credential could not be saved to the Keychain."
+        case .removeFailed: "The credential could not be removed from the Keychain."
         }
     }
 }
@@ -66,7 +68,7 @@ public struct SecurityKeychainStore: KeychainStore {
     public func removeSecret(for id: UUID) throws {
         let status = SecItemDelete(query(for: id, returning: false) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainStoreError.writeFailed
+            throw KeychainStoreError.removeFailed
         }
     }
 

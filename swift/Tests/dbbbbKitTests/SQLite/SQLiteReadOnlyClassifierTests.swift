@@ -1,7 +1,7 @@
 import XCTest
 @testable import dbbbbKit
 
-final class SQLClassifierTests: XCTestCase {
+final class SQLiteReadOnlyClassifierTests: XCTestCase {
     private func assertAllowed(_ sql: String, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertNoThrow(try assertSQLiteReadOnlySQL(sql), sql, file: file, line: line)
     }
@@ -49,6 +49,34 @@ final class SQLClassifierTests: XCTestCase {
         assertRejected("CREATE TABLE t (x INTEGER)")
         assertRejected("REPLACE INTO t VALUES (1)")
         assertRejected("ALTER TABLE t ADD COLUMN y INTEGER")
+    }
+
+    func testRejectsEndAsTransactionStatement() {
+        assertRejected("END")
+        assertRejected("END TRANSACTION")
+        // An END that closes no CASE is the COMMIT synonym or malformed SQL.
+        assertRejected("SELECT 1 END")
+    }
+
+    func testRejectsReplaceIntoStatement() {
+        assertRejected("REPLACE INTO t VALUES (1)")
+        assertRejected("REPLACE INTO t SELECT * FROM other")
+    }
+
+    // MARK: - CASE expressions and replace() are not writes
+
+    func testAllowsCaseExpressions() {
+        assertAllowed("SELECT CASE WHEN x > 1 THEN 'a' ELSE 'b' END FROM t")
+        assertAllowed("SELECT CASE x WHEN 1 THEN 2 END FROM t")
+        assertAllowed("SELECT CASE WHEN CASE WHEN 1 THEN 2 END = 2 THEN 3 END")
+        assertAllowed("SELECT * FROM t ORDER BY CASE WHEN x IS NULL THEN 1 ELSE 0 END, x")
+        assertAllowed("WITH ranked AS (SELECT CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END AS sign FROM t) SELECT * FROM ranked")
+    }
+
+    func testAllowsReplaceFunction() {
+        assertAllowed("SELECT replace('abc', 'a', 'b')")
+        assertAllowed("SELECT replace(hex(zeroblob(4)), '00', 'xx') FROM t")
+        assertAllowed("SELECT * FROM t WHERE replace(name, ' ', '') = 'abc'")
     }
 
     func testRejectsWriteHiddenInWith() {

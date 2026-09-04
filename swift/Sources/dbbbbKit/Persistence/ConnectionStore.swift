@@ -181,8 +181,10 @@ public final class ConnectionStore: @unchecked Sendable {
             return ([], false)
         }
         guard let manifest = try? JSONDecoder().decode(Manifest.self, from: data) else {
-            // Corrupt file: start empty, but allow rewriting it.
-            return ([], true)
+            // Corrupt file (undecodable or missing version): quarantine it to
+            // a `.corrupt-<timestamp>` backup first, then start empty and allow
+            // rewriting. If the backup fails, never clobber the original.
+            return ([], CorruptFileBackup.backup(fileURL))
         }
         var seen = Set<UUID>()
         return (manifest.connections.filter { seen.insert($0.id).inserted }, true)
@@ -193,6 +195,6 @@ public final class ConnectionStore: @unchecked Sendable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(Manifest(version: Self.fileVersion, connections: records))
-        try AtomicFileWriter.write(data, to: fileURL)
+        try AtomicFileWriter.write(data, to: fileURL, securingDirectory: true)
     }
 }

@@ -97,7 +97,7 @@ final class SQLiteChangeBindingTests: XCTestCase {
             ("status", .string("paid")), ("note", .string("ready")), ("unchanged", .number(4)),
         ]
         let plan = try SQLiteChangePlanner.planUpdate(
-            table: "orders",
+            table: "orders", columnTypes: [:],
             primaryKey: primaryKey, original: original, current: current)
         let columns = SQLiteChangeMapper.bindColumns(
             primaryKey: primaryKey, original: original, current: current)
@@ -119,7 +119,7 @@ final class SQLiteChangeBindingTests: XCTestCase {
             ("id", .number(42)), ("email", .string("before@example.test")), ("active", .bool(true)),
         ]
         let plan = try SQLiteChangePlanner.planDelete(
-            table: "users", primaryKey: primaryKey, original: original)
+            table: "users", columnTypes: [:], primaryKey: primaryKey, original: original)
         let columns = SQLiteChangeMapper.bindColumns(
             primaryKey: primaryKey, original: original, current: nil)
         XCTAssertEqual(columns, ["id", "email", "active"])

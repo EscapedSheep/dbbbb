@@ -11,8 +11,11 @@ struct MySQLTextQueryResult: Sendable {
 }
 
 extension MySQLConnection {
-    func textQuery(_ sql: String) -> EventLoopFuture<MySQLTextQueryResult> {
-        let command = MySQLTextQueryCommand(sql: sql)
+    /// Runs a text query, keeping at most `rowLimit` rows. Rows past the budget
+    /// are decoded and dropped as they arrive, so memory stays bounded even for
+    /// huge result sets; the caller passes maxRows + 1 to detect truncation.
+    func textQuery(_ sql: String, rowLimit: Int) -> EventLoopFuture<MySQLTextQueryResult> {
+        let command = MySQLTextQueryCommand(sql: sql, rowLimit: rowLimit)
         return self.send(command, logger: self.logger).map { command.result }
     }
 }
@@ -20,7 +23,7 @@ extension MySQLConnection {
 /// Mirrors MySQLNIO's private `MySQLSimpleQueryCommand`, additionally recording
 /// column definitions. All mutation happens on the connection's event loop;
 /// the result is read only after the send future completes.
-private final class MySQLTextQueryCommand: MySQLCommand, @unchecked Sendable {
+final class MySQLTextQueryCommand: MySQLCommand, @unchecked Sendable {
     enum State {
         case ready
         case columns(count: UInt64)
@@ -29,6 +32,7 @@ private final class MySQLTextQueryCommand: MySQLCommand, @unchecked Sendable {
     }
 
     let sql: String
+    let rowLimit: Int
     var state: State = .ready
     var columns: [MySQLProtocol.ColumnDefinition41] = []
     var rows: [MySQLRow] = []
@@ -37,8 +41,9 @@ private final class MySQLTextQueryCommand: MySQLCommand, @unchecked Sendable {
         MySQLTextQueryResult(columns: columns, rows: rows)
     }
 
-    init(sql: String) {
+    init(sql: String, rowLimit: Int) {
         self.sql = sql
+        self.rowLimit = max(0, rowLimit)
     }
 
     func handle(
@@ -79,7 +84,9 @@ private final class MySQLTextQueryCommand: MySQLCommand, @unchecked Sendable {
                 return MySQLCommandState(done: true)
             }
             let row = try MySQLProtocol.TextResultSetRow.decode(from: &packet, columnCount: columns.count)
-            self.rows.append(MySQLRow(format: .text, columnDefinitions: columns, values: row.values))
+            if self.rows.count < self.rowLimit {
+                self.rows.append(MySQLRow(format: .text, columnDefinitions: columns, values: row.values))
+            }
             return MySQLCommandState()
         case .done:
             throw MySQLError.protocolError

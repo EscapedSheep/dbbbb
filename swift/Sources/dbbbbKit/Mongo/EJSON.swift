@@ -1,4 +1,5 @@
 import Foundation
+import dbbbbCore
 
 /// Errors raised while parsing or validating canonical Extended JSON input.
 /// `userMessage` strings are safe to show in the UI.
@@ -593,5 +594,90 @@ enum EJSONSerializer {
             }
         }
         return result + "\""
+    }
+}
+
+extension EJSONSerializer {
+    /// Every `$`-tagged display shape `MongoDisplayValue` can emit, plus the
+    /// recognized-but-rejected tags: export passes these through verbatim.
+    private static let displayTagNames: Set<String> = Set([
+        "$oid", "$numberInt", "$numberLong", "$numberDouble", "$numberDecimal",
+        "$date", "$binary", "$regularExpression", "$timestamp", "$minKey", "$maxKey",
+    ]).union(EJSON.unsupportedTags)
+
+    /// Canonical Extended JSON rendering of one *displayed* MongoDB document,
+    /// used by JSONL result export so that export → import round-trips BSON
+    /// types (the old CanonicalJSON export sorted keys and emitted bare JSON
+    /// numbers, which re-imported as int32):
+    ///
+    /// - Object key order is preserved exactly as displayed; BSON key order is
+    ///   semantic and is never sorted.
+    /// - `$`-tagged display objects (`$oid`, `$date`, `$numberLong`,
+    ///   `$numberDecimal`, `$binary`, `$regularExpression`, `$timestamp`,
+    ///   `$minKey`/`$maxKey`, …) pass through verbatim; inside a tag payload,
+    ///   numbers render as raw JSON literals so `$timestamp` t/i stay integers.
+    /// - A bare `.number` is emitted as `$numberDouble`, so integral doubles
+    ///   such as `5.0` re-import as doubles. BSON int32 fields also cross the
+    ///   display layer as bare `.number` (indistinguishable from doubles by
+    ///   design, matching the Electron wire shape), so they re-import widened
+    ///   to double — int32 round-trip fidelity would require a display-layer
+    ///   change and is out of scope here.
+    /// - `$code` and the other unsupported tags are written out as-is but stay
+    ///   fail-closed on import (`EJSONError.unsupportedTag`): documents that
+    ///   contain them export fine yet cannot be re-imported.
+    /// - Values without a portable EJSON form (raw binary display values,
+    ///   non-finite bare numbers) fail closed with
+    ///   `ResultExportError.unsupportedValue`, like the CSV path.
+    static func serialize(displayValue value: DisplayValue) throws -> String {
+        try serialize(displayValue: value, depth: 0, inTagPayload: false)
+    }
+
+    private static func serialize(
+        displayValue value: DisplayValue, depth: Int, inTagPayload: Bool
+    ) throws -> String {
+        guard depth <= EJSON.maxDepth else { throw ResultExportError.unsupportedValue }
+        switch value {
+        case .null:
+            return "null"
+        case .bool(let flag):
+            return flag ? "true" : "false"
+        case .number(let number):
+            guard number.isFinite else { throw ResultExportError.unsupportedValue }
+            if inTagPayload {
+                return rawNumberLiteral(number)
+            }
+            return #"{"$numberDouble":"# + escape(String(number)) + "}"
+        case .string(let string):
+            return escape(string)
+        case .binary:
+            // MongoDB binary crosses the display layer as a `$binary` tag, so
+            // a raw DisplayValue.binary here has no portable EJSON form.
+            throw ResultExportError.unsupportedValue
+        case .array(let items):
+            return try "[" + items.map {
+                try serialize(displayValue: $0, depth: depth + 1, inTagPayload: inTagPayload)
+            }.joined(separator: ",") + "]"
+        case .object(let pairs):
+            if !inTagPayload, pairs.count == 1, displayTagNames.contains(pairs[0].key) {
+                let payload = try serialize(
+                    displayValue: pairs[0].value, depth: depth + 1, inTagPayload: true)
+                return "{" + escape(pairs[0].key) + ":" + payload + "}"
+            }
+            let properties = try pairs.map {
+                try escape($0.key) + ":"
+                    + serialize(displayValue: $0.value, depth: depth + 1, inTagPayload: inTagPayload)
+            }
+            return "{" + properties.joined(separator: ",") + "}"
+        }
+    }
+
+    /// Raw JSON number literal for tag payloads (same JS `JSON.stringify`
+    /// semantics as `CanonicalJSON.jsonNumber`): integral values within the
+    /// safe-integer range keep their exact integer text.
+    private static func rawNumberLiteral(_ number: Double) -> String {
+        if number == number.rounded(), abs(number) < 9_007_199_254_740_992 {
+            return String(Int64(number))
+        }
+        return String(number)
     }
 }

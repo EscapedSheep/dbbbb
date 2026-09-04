@@ -3,6 +3,32 @@ import XCTest
 @testable import dbbbbKit
 
 final class KeychainStoreTests: XCTestCase {
+    func testRemoveFailureHasDedicatedErrorAndMessage() {
+        XCTAssertEqual(
+            KeychainStoreError.removeFailed.userMessage,
+            "The credential could not be removed from the Keychain.")
+        XCTAssertNotEqual(
+            KeychainStoreError.removeFailed.userMessage,
+            KeychainStoreError.writeFailed.userMessage)
+    }
+
+    private struct FailingRemoveKeychainStore: KeychainStore {
+        func secret(for id: UUID) throws -> String? { nil }
+        func setSecret(_ secret: String, for id: UUID) throws {}
+        func removeSecret(for id: UUID) throws { throw KeychainStoreError.removeFailed }
+    }
+
+    /// A Keychain removal failure surfaces to the caller as removeFailed.
+    func testRemoveFailurePropagatesThroughConnectionStore() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dbbbb-keychain-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ConnectionStore(directory: directory, keychain: FailingRemoveKeychainStore())
+        XCTAssertThrowsError(try store.remove(id: UUID())) { error in
+            XCTAssertEqual(error as? KeychainStoreError, .removeFailed)
+        }
+    }
+
     func testInMemoryStoreRoundTrip() throws {
         let store = InMemoryKeychainStore()
         let id = UUID()

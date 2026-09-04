@@ -96,7 +96,7 @@ final class PostgresChangeBindingTests: XCTestCase {
             ("status", .string("paid")), ("note", .string("ready")), ("unchanged", .number(4)),
         ]
         let plan = try PostgresChangePlanner.planUpdate(
-            schema: "sales", table: "orders",
+            schema: "sales", table: "orders", columnTypeOIDs: [:],
             primaryKey: primaryKey, original: original, current: current)
         let columns = PostgresChangeMapper.bindColumns(
             primaryKey: primaryKey, original: original, current: current)
@@ -118,7 +118,8 @@ final class PostgresChangeBindingTests: XCTestCase {
             ("id", .number(42)), ("email", .string("before@example.test")), ("active", .bool(true)),
         ]
         let plan = try PostgresChangePlanner.planDelete(
-            schema: "public", table: "users", primaryKey: primaryKey, original: original)
+            schema: "public", table: "users", columnTypeOIDs: [:],
+            primaryKey: primaryKey, original: original)
         let columns = PostgresChangeMapper.bindColumns(
             primaryKey: primaryKey, original: original, current: nil)
         XCTAssertEqual(columns, ["id", "email", "active"])

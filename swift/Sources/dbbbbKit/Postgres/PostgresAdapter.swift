@@ -347,6 +347,7 @@ public actor PostgresAdapter: DatabaseAdapter {
             let timezoneOffset = sessionTimezoneOffset()
 
             var rawRows: [[DisplayValue]] = []
+            rawRows.reserveCapacity(options.maxRows + 1)
             for try await row in sequence {
                 rawRows.append(row.map { cell in
                     PostgresWireCodec.displayValue(
@@ -354,6 +355,9 @@ public actor PostgresAdapter: DatabaseAdapter {
                         bytes: cell.bytes.map { Array($0.readableBytesView) },
                         timezoneOffsetSeconds: timezoneOffset)
                 })
+                // One extra row proves truncation; leaving the loop early makes
+                // PostgresNIO cancel the stream and drain the rest.
+                if rawRows.count > options.maxRows { break }
             }
             if cancelledRequestIDs.contains(options.requestID)
                 || timedOutRequestIDs.contains(options.requestID) {
@@ -395,9 +399,12 @@ public actor PostgresAdapter: DatabaseAdapter {
     // MARK: - Cancel
 
     public func cancel(requestID: UUID) async throws {
-        guard activeRequestIDs.contains(requestID) else { return }
+        // Pre-register unconditionally: a cancel that arrives before execute
+        // must still stop the query at its first cancellation checkpoint.
         cancelledRequestIDs.insert(requestID)
-        guard let backendPID = backendPIDs[requestID] else { return }
+        guard activeRequestIDs.contains(requestID),
+              let backendPID = backendPIDs[requestID]
+        else { return }
         do {
             try await dispatchCancel(backendPID: backendPID)
         } catch {
@@ -563,11 +570,11 @@ extension PostgresAdapter: SupportsEditing {
             let plan: PostgresParameterizedPlan
             if let current {
                 plan = try PostgresChangePlanner.planUpdate(
-                    schema: ref.schema, table: name,
+                    schema: ref.schema, table: name, columnTypeOIDs: metadata.columnTypeOIDs,
                     primaryKey: primaryKey, original: original, current: current)
             } else {
                 plan = try PostgresChangePlanner.planDelete(
-                    schema: ref.schema, table: name,
+                    schema: ref.schema, table: name, columnTypeOIDs: metadata.columnTypeOIDs,
                     primaryKey: primaryKey, original: original)
             }
 

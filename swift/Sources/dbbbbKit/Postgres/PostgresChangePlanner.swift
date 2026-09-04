@@ -40,7 +40,12 @@ public struct PostgresChangePlanError: dbbbbError, Equatable {
 /// concurrency). Ported from `src/main/editing/change-planner.ts`: every
 /// `UPDATE`/`DELETE` is parameterized, matches the primary key plus *all*
 /// original column values with `IS NOT DISTINCT FROM`, and returns the changed
-/// row via `RETURNING *`.
+/// row via `RETURNING *`. Text-family and `numeric` columns are matched
+/// byte-for-byte on their canonical text (`convert_to(..., 'UTF8')` on both
+/// sides, keeping the NULL-safe semantics): the column collation (a
+/// nondeterministic ICU one equates case/accent variants) and `numeric`
+/// value equality (which ignores display scale, `1.10` vs `1.1000`) would
+/// otherwise hide a concurrent change from the lock.
 public enum PostgresChangePlanner {
     /// JS-era prototype-pollution guards; kept because record keys still come
     /// from a UI round-trip and are never valid column choices for us.
@@ -59,9 +64,21 @@ public enum PostgresChangePlanner {
         "tsmultirange", "tstzmultirange", "datemultirange",
     ]
 
+    /// Type OIDs whose optimistic-lock predicates compare the canonical text
+    /// byte-for-byte instead of using native equality: the text family
+    /// (19 `name`, 25 `text`, 1042 `bpchar`, 1043 `varchar`), whose equality
+    /// follows the column collation (nondeterministic ICU collations equate
+    /// case/accent variants), and 1700 `numeric`, whose value equality
+    /// ignores display scale (`1.10` vs `1.1000` are stored distinctly but
+    /// compare equal). Arrays, domains, and extension types keep native
+    /// equality — their renderings are not guaranteed to round-trip.
+    public static let byteComparedTypeOIDs: Set<Int> = [19, 25, 1042, 1043, 1700]
+
     /// Introspection query for the change-target metadata (used by the editing
     /// capability; the planner itself is offline). Columns without UPDATE
-    /// privilege are excluded; DELETE is table-level (column-level DELETE
+    /// privilege are excluded, as are generated and identity columns — a table
+    /// containing them is refused wholesale at mapping time, matching the
+    /// MySQL/SQLite engines. DELETE is table-level (column-level DELETE
     /// privileges do not exist — `has_column_privilege(..., 'DELETE')` errors
     /// with sqlState 22023 on a live server), so it is checked per table.
     public static let listTableChangeColumnsSQL = """
@@ -89,6 +106,8 @@ public enum PostgresChangePlanner {
           AND c.relkind IN ('r', 'p', 'f')
           AND a.attnum > 0
           AND NOT a.attisdropped
+          AND a.attgenerated = ''
+          AND a.attidentity = ''
           AND pg_catalog.has_column_privilege(c.oid, a.attname, 'UPDATE')
           AND pg_catalog.has_table_privilege(c.oid, 'DELETE')
         ORDER BY a.attnum
@@ -232,6 +251,7 @@ public enum PostgresChangePlanner {
 
     private static func appendWhere(
         values: inout [DisplayValue],
+        columnTypeOIDs: [String: Int],
         primaryKey: [PostgresFieldEntry],
         original: [PostgresFieldEntry]
     ) throws -> String {
@@ -240,22 +260,42 @@ public enum PostgresChangePlanner {
 
         for (column, value) in primaryKey {
             values.append(value)
-            try conditions.append("\(quoteIdentifier(column)) IS NOT DISTINCT FROM $\(values.count)")
+            try conditions.append(equality(
+                column: column, columnTypeOIDs: columnTypeOIDs, placeholder: values.count))
         }
         for (column, value) in original where !keyColumns.contains(column) {
             values.append(value)
-            try conditions.append("\(quoteIdentifier(column)) IS NOT DISTINCT FROM $\(values.count)")
+            try conditions.append(equality(
+                column: column, columnTypeOIDs: columnTypeOIDs, placeholder: values.count))
         }
         return conditions.joined(separator: "\n  AND ")
+    }
+
+    /// The NULL-safe optimistic-lock predicate for one column. Byte-compared
+    /// columns match their canonical UTF-8 text on both sides (`convert_to`
+    /// maps NULL to NULL, so `IS NOT DISTINCT FROM` keeps its NULL
+    /// semantics); everything else compares natively.
+    private static func equality(
+        column: String, columnTypeOIDs: [String: Int], placeholder: Int
+    ) throws -> String {
+        let quoted = try quoteIdentifier(column)
+        if let oid = columnTypeOIDs[column], byteComparedTypeOIDs.contains(oid) {
+            return "convert_to(\(quoted)::text, 'UTF8')"
+                + " IS NOT DISTINCT FROM convert_to($\(placeholder)::text, 'UTF8')"
+        }
+        return "\(quoted) IS NOT DISTINCT FROM $\(placeholder)"
     }
 
     // MARK: - Plans
 
     /// Plans one optimistic row update. `original` and `current` must contain
     /// the same columns; only values that actually changed are assigned.
+    /// `columnTypeOIDs` (from the change metadata) selects byte-level
+    /// matching for the text family and `numeric`.
     public static func planUpdate(
         schema: String,
         table: String,
+        columnTypeOIDs: [String: Int],
         primaryKey: [PostgresFieldEntry],
         original: [PostgresFieldEntry],
         current: [PostgresFieldEntry]
@@ -291,7 +331,8 @@ public enum PostgresChangePlanner {
         }
         var whereValues = values
         let whereClause = try appendWhere(
-            values: &whereValues, primaryKey: target.primaryKey, original: target.original)
+            values: &whereValues, columnTypeOIDs: columnTypeOIDs,
+            primaryKey: target.primaryKey, original: target.original)
 
         return PostgresParameterizedPlan(
             text: [
@@ -304,9 +345,11 @@ public enum PostgresChangePlanner {
     }
 
     /// Plans one optimistic row delete without executing it.
+    /// `columnTypeOIDs` selects byte-level matching, as in `planUpdate`.
     public static func planDelete(
         schema: String,
         table: String,
+        columnTypeOIDs: [String: Int],
         primaryKey: [PostgresFieldEntry],
         original: [PostgresFieldEntry]
     ) throws -> PostgresParameterizedPlan {
@@ -314,7 +357,8 @@ public enum PostgresChangePlanner {
             schema: schema, table: table, primaryKey: primaryKey, original: original)
         var values: [DisplayValue] = []
         let whereClause = try appendWhere(
-            values: &values, primaryKey: target.primaryKey, original: target.original)
+            values: &values, columnTypeOIDs: columnTypeOIDs,
+            primaryKey: target.primaryKey, original: target.original)
 
         return PostgresParameterizedPlan(
             text: [

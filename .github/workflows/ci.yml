@@ -4,86 +4,27 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: '0 2 * * *'
   workflow_dispatch:
 
 jobs:
-  verify:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  swift:
+    # The Electron implementation under src/ is deprecated; CI validates the
+    # current Swift product under swift/. Integration tests skip automatically
+    # without DBBBB_TEST_* URLs, so no database services are needed here.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
+      - name: Select Xcode (Swift 6.x toolchain)
+        run: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
 
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+      - name: Show toolchain
+        run: swift --version
 
-  integration:
-    # Needs live databases, so it only runs on the nightly schedule or on demand.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: dbbbb
-          POSTGRES_PASSWORD: dbbbb
-          POSTGRES_DB: dbbbb_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U dbbbb -d dbbbb_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      mongo:
-        image: mongo:7
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      mysql:
-        image: mysql:8
-        env:
-          MYSQL_ROOT_PASSWORD: dbbbb
-          MYSQL_DATABASE: dbbbb_test
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pdbbbb"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    env:
-      DBBBB_TEST_POSTGRES_URL: postgres://dbbbb:dbbbb@localhost:5432/dbbbb_test
-      DBBBB_TEST_POSTGRES_ENABLE_WRITE: '1'
-      DBBBB_TEST_MONGO_URL: mongodb://localhost:27017/dbbbb_test
-      DBBBB_TEST_MONGO_DATABASE: dbbbb_test
-      DBBBB_TEST_MONGO_ENABLE_WRITE: '1'
-      DBBBB_MONGO_INTEGRATION_RUNNER: '1'
-      DBBBB_TEST_MYSQL_URL: mysql://root:dbbbb@localhost:3306/dbbbb_test?sslmode=disable
-    steps:
-      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build
+        working-directory: swift
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - run: npm ci
-      - run: npm run test:integration:postgres
-      - run: npm run test:integration:mongo
-      - run: npm run test:integration:mysql
+      - name: Test
+        run: swift test
+        working-directory: swift

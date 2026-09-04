@@ -142,6 +142,25 @@ final class PostgresAdapterIntegrationTests: XCTestCase {
         XCTAssertEqual(result.meta.count, 3)
     }
 
+    /// A large result set stops at maxRows + 1 instead of materializing in
+    /// full; the driver cancels and drains the rest of the stream.
+    func testLargeResultSetTerminatesEarly() async throws {
+        let result = try await adapter.execute(
+            .sql("SELECT generate_series(1, 1000000) AS n"),
+            options: ExecuteOptions(timeout: .seconds(30), maxRows: 5, maxBytes: 5 * 1024 * 1024))
+        let (_, bounded) = try rows(result)
+        XCTAssertEqual(bounded.count, 5)
+        XCTAssertTrue(result.meta.truncated)
+        XCTAssertEqual(bounded.map { $0[0] },
+                       [.number(1), .number(2), .number(3), .number(4), .number(5)])
+
+        // The connection survived the abandoned stream and serves the next query.
+        let followUp = try await adapter.execute(
+            .sql("SELECT 42 AS answer"), options: ExecuteOptions())
+        let (_, followUpRows) = try rows(followUp)
+        XCTAssertEqual(followUpRows, [[.number(42)]])
+    }
+
     func testCancelStopsLongRunningQuery() async throws {
         let adapter = try XCTUnwrap(adapter)
         let options = ExecuteOptions(timeout: .seconds(30))
@@ -313,6 +332,97 @@ final class PostgresAdapterIntegrationTests: XCTestCase {
         XCTAssertEqual(updatedRecord["tags"], original["tags"])
         XCTAssertEqual(updatedRecord["numbers"], original["numbers"])
         XCTAssertEqual(updatedRecord["flag"], .bool(false))
+    }
+
+    /// Byte-level lock proof against real collation/scale semantics: under a
+    /// nondeterministic ICU collation a concurrent case-only rewrite, and
+    /// under `numeric` a scale-only rewrite (`1.10` → `1.1000`), are
+    /// invisible to native equality and must surface as
+    /// optimistic-concurrency conflicts; the untouched row still edits
+    /// cleanly.
+    func testApplyDataChangeDetectsCollationAndScaleOnlyConcurrentRewrite() async throws {
+        _ = try await adapter.execute(.sql("""
+            CREATE COLLATION IF NOT EXISTS dbbbb_it_nd
+                (provider = icu, locale = 'und', deterministic = false)
+            """), options: ExecuteOptions())
+        _ = try await adapter.execute(.sql("""
+            CREATE TABLE IF NOT EXISTS dbbbb_it_edit_ci (
+                id int4 PRIMARY KEY,
+                code text COLLATE dbbbb_it_nd,
+                amount numeric,
+                note text
+            )
+            """), options: ExecuteOptions())
+        _ = try await adapter.execute(.sql(
+            "TRUNCATE dbbbb_it_edit_ci"), options: ExecuteOptions())
+        _ = try await adapter.execute(.sql(
+            "INSERT INTO dbbbb_it_edit_ci VALUES (1, 'ABC', 1.10, 'keep')"),
+            options: ExecuteOptions())
+
+        let table = try await editingTable("dbbbb_it_edit_ci")
+        let (columns, previewRows) = try rows(try await adapter.previewObject(table))
+        guard let row = previewRows.first(where: { $0[0] == .number(1) }) else {
+            return XCTFail("inserted row missing from preview")
+        }
+        let original = originalRecord(columns: columns, row: row)
+        XCTAssertEqual(original["code"], .string("ABC"))
+        XCTAssertEqual(original["amount"], .string("1.10"))
+
+        // Control: the untouched row edits cleanly under the byte-level lock
+        // (text and numeric both round-trip through convert_to byte equality).
+        _ = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: original,
+            operation: .update(changed: ["note": .string("edited")])))
+
+        // A concurrent case-only rewrite (equal under the nondeterministic
+        // collation) must conflict.
+        let (staleColumns, staleRows) = try rows(try await adapter.previewObject(table))
+        let stale = originalRecord(columns: staleColumns, row: staleRows[0])
+        _ = try await adapter.execute(.sql(
+            "UPDATE dbbbb_it_edit_ci SET code = 'abc' WHERE id = 1"),
+            options: ExecuteOptions())
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table,
+                original: stale,
+                operation: .update(changed: ["note": .string("touched")])))
+            XCTFail("case-only rewrite under a nondeterministic collation must conflict")
+        } catch let error as PostgresAdapterError {
+            XCTAssertTrue(error.userMessage.contains("optimistic-concurrency conflict"),
+                          error.userMessage)
+        }
+
+        // A concurrent scale-only rewrite (numerically equal) must conflict.
+        _ = try await adapter.execute(.sql(
+            "UPDATE dbbbb_it_edit_ci SET amount = 1.1000 WHERE id = 1"),
+            options: ExecuteOptions())
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table,
+                original: stale,
+                operation: .update(changed: ["note": .string("touched")])))
+            XCTFail("scale-only rewrite on numeric must conflict")
+        } catch let error as PostgresAdapterError {
+            XCTAssertTrue(error.userMessage.contains("optimistic-concurrency conflict"),
+                          error.userMessage)
+        }
+        let (_, checkRows) = try rows(try await adapter.execute(.sql(
+            "SELECT amount FROM dbbbb_it_edit_ci WHERE id = 1"), options: ExecuteOptions()))
+        XCTAssertEqual(checkRows.first?.first, .string("1.1000"))
+
+        // Stale deletes conflict too, and the externally rewritten row survives.
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table, original: stale, operation: .delete))
+            XCTFail("stale delete must conflict")
+        } catch let error as PostgresAdapterError {
+            XCTAssertTrue(error.userMessage.contains("optimistic-concurrency conflict"),
+                          error.userMessage)
+        }
+        let (_, remaining) = try rows(try await adapter.execute(.sql(
+            "SELECT code FROM dbbbb_it_edit_ci WHERE id = 1"), options: ExecuteOptions()))
+        XCTAssertEqual(remaining.first?.first, .string("abc"))
     }
 
     func testApplyDataChangeRejectsReadOnlyAndUnknownTargets() async throws {

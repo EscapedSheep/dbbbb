@@ -8,6 +8,9 @@ public enum MySQLAdapterError: dbbbbError, Equatable {
     case cancelled
     case timedOut
     case connectTimedOut
+    /// The server handshake lacked CLIENT_SSL, so the TLS-required session
+    /// would have silently degraded to plaintext.
+    case tlsRequired
     /// Read-only SQL the classifier could not prove safe; it fails closed.
     case unclassifiableSQL(position: Int)
     case multipleStatements
@@ -28,6 +31,8 @@ public enum MySQLAdapterError: dbbbbError, Equatable {
             "MySQL query timed out."
         case .connectTimedOut:
             "Could not connect to MySQL: connection timed out."
+        case .tlsRequired:
+            "The MySQL server does not support TLS, but this connection requires TLS."
         case .unclassifiableSQL(let position):
             "Read-only mode could not safely classify SQL near character \(position)."
         case .multipleStatements:

@@ -68,7 +68,9 @@ public final class QueryLibraryStore: @unchecked Sendable {
     private let now: @Sendable () -> Date
     private let lock = NSLock()
     /// Newest first. Value type copies mean callers can never mutate the store.
-    public private(set) var entries: [QueryEntry]
+    public var entries: [QueryEntry] { lock.withLock { storedEntries } }
+    /// Backing storage for `entries`; accessed only while holding `lock`.
+    private var storedEntries: [QueryEntry]
     /// False when the on-disk file uses a schema we do not understand —
     /// mutations then run in memory only so the user's file is never clobbered.
     private var writeEnabled: Bool
@@ -89,7 +91,7 @@ public final class QueryLibraryStore: @unchecked Sendable {
         self.now = now
         self.maxLibraryBytes = maxLibraryBytes
         let loaded = Self.loadFile(from: fileURL)
-        entries = loaded.entries
+        storedEntries = loaded.entries
         writeEnabled = loaded.writeEnabled
     }
 
@@ -98,20 +100,21 @@ public final class QueryLibraryStore: @unchecked Sendable {
     /// back-to-back refreshes the newest entry rather than appending a dupe.
     @discardableResult
     public func record(connectionID: UUID, engine: DatabaseEngine, text: String, collection: String? = nil) throws -> QueryEntry {
+        // The 32 KB limit is measured in UTF-8 bytes, not grapheme clusters.
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              text.count <= Self.maxTextLength else {
+              text.utf8.count <= Self.maxTextLength else {
             throw QueryLibraryError.invalidText
         }
         return try lock.withLock {
             let createdAt = now()
             let title = Self.title(for: text, engine: engine, collection: collection)
-            if let first = entries.first, first.connectionID == connectionID,
+            if let first = storedEntries.first, first.connectionID == connectionID,
                first.engine == engine, first.text == text, first.collection == collection {
                 let refreshed = QueryEntry(
                     id: first.id, connectionID: first.connectionID, title: title,
                     engine: first.engine, text: first.text, collection: first.collection,
                     createdAt: createdAt, favorite: first.favorite)
-                var next = entries
+                var next = storedEntries
                 next[0] = refreshed
                 try persistLocked(next, requiredID: refreshed.id)
                 return refreshed
@@ -119,7 +122,7 @@ public final class QueryLibraryStore: @unchecked Sendable {
             let entry = QueryEntry(
                 connectionID: connectionID, title: title, engine: engine,
                 text: text, collection: collection, createdAt: createdAt)
-            try persistLocked([entry] + entries, requiredID: entry.id)
+            try persistLocked([entry] + storedEntries, requiredID: entry.id)
             return entry
         }
     }
@@ -127,31 +130,48 @@ public final class QueryLibraryStore: @unchecked Sendable {
     @discardableResult
     public func toggleFavorite(id: UUID) throws -> QueryEntry? {
         try lock.withLock {
-            guard let index = entries.firstIndex(where: { $0.id == id }) else { return nil }
-            var updated = entries[index]
+            guard let index = storedEntries.firstIndex(where: { $0.id == id }) else { return nil }
+            var updated = storedEntries[index]
             updated.favorite.toggle()
-            var next = entries
+            var next = storedEntries
             next[index] = updated
             try persistLocked(next, requiredID: updated.id)
             return updated
         }
     }
 
+    /// `onPersistError` receives any failure to write the file (the in-memory
+    /// removal still stands), so persistence errors are reported explicitly
+    /// instead of being swallowed; the default keeps source compatibility for
+    /// callers that predate the error channel.
     @discardableResult
-    public func remove(id: UUID) -> Bool {
-        lock.withLock {
-            let next = entries.filter { $0.id != id }
-            guard next.count != entries.count else { return false }
-            try? persistLocked(next)
-            return true
+    public func remove(id: UUID, onPersistError: (any Error) -> Void = { _ in }) -> Bool {
+        let (removed, persistError): (Bool, (any Error)?) = lock.withLock {
+            let next = storedEntries.filter { $0.id != id }
+            guard next.count != storedEntries.count else { return (false, nil) }
+            do {
+                try persistLocked(next)
+                return (true, nil)
+            } catch {
+                return (true, error)
+            }
         }
+        if let persistError { onPersistError(persistError) }
+        return removed
     }
 
-    /// Drops all non-favorite entries.
-    public func clearHistory() {
-        lock.withLock {
-            try? persistLocked(entries.filter(\.favorite))
+    /// Drops all non-favorite entries. See `remove(id:onPersistError:)` for
+    /// the error-reporting contract.
+    public func clearHistory(onPersistError: (any Error) -> Void = { _ in }) {
+        let persistError: (any Error)? = lock.withLock {
+            do {
+                try persistLocked(storedEntries.filter(\.favorite))
+                return nil
+            } catch {
+                return error
+            }
         }
+        if let persistError { onPersistError(persistError) }
     }
 
     // MARK: Private
@@ -197,9 +217,9 @@ public final class QueryLibraryStore: @unchecked Sendable {
         if let requiredID, !fitted.contains(where: { $0.id == requiredID }) {
             throw QueryLibraryError.storageFullOfFavorites
         }
-        entries = fitted
+        storedEntries = fitted
         guard writeEnabled else { return }
-        try AtomicFileWriter.write(data, to: fileURL)
+        try AtomicFileWriter.write(data, to: fileURL, securingDirectory: true)
     }
 
     private static func encode(_ entries: [QueryEntry]) throws -> Data {
@@ -228,14 +248,16 @@ public final class QueryLibraryStore: @unchecked Sendable {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let file = try? decoder.decode(LibraryFile.self, from: data) else {
-            // Corrupt file: start empty, but allow rewriting it.
-            return ([], true)
+            // Corrupt file (undecodable or missing version): quarantine it to
+            // a `.corrupt-<timestamp>` backup first, then start empty and allow
+            // rewriting. If the backup fails, never clobber the original.
+            return ([], CorruptFileBackup.backup(fileURL))
         }
         var seen = Set<UUID>()
         let sanitized = file.entries
             .filter { entry in
                 !entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    && entry.text.count <= maxTextLength
+                    && entry.text.utf8.count <= maxTextLength
                     && !entry.title.isEmpty && entry.title.count <= maxTitleLength
                     && seen.insert(entry.id).inserted
             }

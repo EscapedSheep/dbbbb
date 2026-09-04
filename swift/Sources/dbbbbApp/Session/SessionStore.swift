@@ -13,6 +13,30 @@ private final class CancelFlag: Sendable {
     var isSet: Bool { flag.withLock { $0 } }
 }
 
+/// Serializes import progress callbacks onto the main actor. Adapters invoke
+/// `onProgress` from their own executor, possibly in bursts; only the latest
+/// counters matter, so bursts coalesce into at most one pending hop — no
+/// per-event task flood and no out-of-order delivery.
+final class ImportProgressRelay: Sendable {
+    private let latest = Mutex<ImportProgress?>(nil)
+    private let hopScheduled = Mutex(false)
+
+    func send(_ progress: ImportProgress, deliver: @escaping @MainActor @Sendable (ImportProgress) -> Void) {
+        latest.withLock { $0 = progress }
+        let shouldSchedule = hopScheduled.withLock { scheduled -> Bool in
+            if scheduled { return false }
+            scheduled = true
+            return true
+        }
+        guard shouldSchedule else { return }
+        Task { @MainActor in
+            hopScheduled.withLock { $0 = false }
+            let progress = latest.withLock { $0 }
+            if let progress { deliver(progress) }
+        }
+    }
+}
+
 /// UI-facing session state for one window. Main-actor isolated; adapters are
 /// `Sendable` and only called with `await`, so no shared mutable state crosses tasks.
 @MainActor
@@ -72,6 +96,10 @@ final class SessionStore {
 
     private var executionTask: Task<Void, Never>?
     private var activeRequestID: UUID?
+    /// Set when the user cancelled the in-flight request; adapter-specific
+    /// cancellation errors are then silenced even when they are not
+    /// `CancellationError` (each engine has its own cancelled type).
+    private var cancellationRequested = false
 
     var selectedSession: Session? { sessions.first { $0.id == selectedConnectionID } }
 
@@ -110,7 +138,14 @@ final class SessionStore {
 
     func selectConnection(_ id: UUID?) {
         guard selectedConnectionID != id else { return }
+        cancelInFlight()
         selectedConnectionID = id
+        resetSelectionState()
+        loadObjects()
+    }
+
+    /// Clears everything tied to the previously selected connection.
+    private func resetSelectionState() {
         objects = []
         selectedObject = nil
         previewedObject = nil
@@ -118,7 +153,6 @@ final class SessionStore {
         errorMessage = nil
         queryText = ""
         mongoQueryMode = .find
-        loadObjects()
     }
 
     func refreshObjects() {
@@ -177,6 +211,12 @@ final class SessionStore {
                     let secret = try connectionStore.secret(for: record.id)
                     let input = try record.makeInput(secret: secret)
                     let adapter = try await makeAdapter(input)
+                    // The user may have removed this connection while the
+                    // reconnect was in flight; never resurrect a zombie session.
+                    guard connectionStore.loadConnections().contains(where: { $0.id == record.id }) else {
+                        await adapter.close()
+                        continue
+                    }
                     // Keep the persisted UUID so the Keychain key and the
                     // manifest entry stay stable across launches.
                     let connected = adapter.profile
@@ -194,10 +234,16 @@ final class SessionStore {
 
     func removeConnection(_ id: UUID) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        if selectedConnectionID == id { cancelInFlight() }
         let session = sessions.remove(at: index)
         if selectedConnectionID == id {
             // Force reselection even if the first session coincides.
             selectedConnectionID = nil
+            // selectConnection(nil) early-returns, so reset explicitly; this
+            // also unsticks isLoadingObjects when the removed connection was
+            // the last one with a load still in flight.
+            resetSelectionState()
+            isLoadingObjects = false
             selectConnection(sessions.first?.id)
         }
         // Demo connections never touch disk or the Keychain.
@@ -257,18 +303,31 @@ final class SessionStore {
 
     func preview(_ object: DatabaseObject) {
         guard let session = selectedSession, !isExecuting else { return }
+        let connectionID = session.id
         selectedObject = object
         previewedObject = object
         errorMessage = nil
         isExecuting = true
+        // Previews register a request ID just like queries, so Cancel works.
+        let requestID = ExecuteOptions().requestID
+        activeRequestID = requestID
         let adapter = session.adapter
-        Task { @MainActor in
-            defer { isExecuting = false }
+        executionTask = Task { @MainActor in
+            defer { finishExecution(for: requestID) }
             do {
-                result = try await adapter.previewObject(object)
-            } catch is CancellationError {
-                // Keep the previous result.
+                let previewed = try await adapter.previewObject(object)
+                // Ignore stale completions after the user switched connections.
+                guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
+                result = previewed
             } catch {
+                guard activeRequestID == requestID else { return }
+                // The screen still shows the previous data; never leave the
+                // preview pointer aimed at the object that never loaded.
+                previewedObject = nil
+                // Cancelled: keep the previous result, no banner.
+                guard !cancellationRequested, !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID else { return }
+                result = nil
                 errorMessage = Self.redactedMessage(for: error)
             }
         }
@@ -296,20 +355,23 @@ final class SessionStore {
         }
         errorMessage = nil
         isExecuting = true
+        let connectionID = session.id
         let options = ExecuteOptions()
-        activeRequestID = options.requestID
+        let requestID = options.requestID
+        activeRequestID = requestID
         let adapter = session.adapter
         executionTask = Task { @MainActor in
-            defer {
-                isExecuting = false
-                activeRequestID = nil
-            }
+            defer { finishExecution(for: requestID) }
             do {
-                result = try await adapter.execute(command, options: options)
+                let executed = try await adapter.execute(command, options: options)
+                // Ignore stale completions after the user switched connections.
+                guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
+                result = executed
                 recordQuery(command, session: session)
-            } catch is CancellationError {
-                // Cancelled: keep the previous result, no banner.
             } catch {
+                // Cancelled: keep the previous result, no banner.
+                guard !cancellationRequested, !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
                 errorMessage = Self.redactedMessage(for: error)
             }
         }
@@ -317,19 +379,45 @@ final class SessionStore {
 
     func cancelQuery() {
         guard let requestID = activeRequestID, let session = selectedSession else { return }
+        cancellationRequested = true
         executionTask?.cancel()
         Task { try? await session.adapter.cancel(requestID: requestID) }
+    }
+
+    /// Cancels any in-flight query/preview and resets execution state; used
+    /// when the selected connection changes or goes away.
+    private func cancelInFlight() {
+        guard isExecuting else { return }
+        let requestID = activeRequestID
+        let session = selectedSession
+        executionTask?.cancel()
+        executionTask = nil
+        isExecuting = false
+        activeRequestID = nil
+        cancellationRequested = false
+        if let requestID, let session {
+            Task { try? await session.adapter.cancel(requestID: requestID) }
+        }
+    }
+
+    /// Resets execution state, but only when this request is still the
+    /// current one — a stale task must not clobber a newer execution.
+    private func finishExecution(for requestID: UUID) {
+        guard activeRequestID == requestID else { return }
+        isExecuting = false
+        activeRequestID = nil
+        cancellationRequested = false
     }
 
     // MARK: Record editing
 
     /// Non-nil when record editing may be offered: the visible result is a
-    /// preview of one table/collection, the profile is writable, and the
-    /// adapter opted into the editing capability. The demo adapter never
-    /// qualifies (fail closed).
+    /// preview of one table/collection, the profile is writable and real, and
+    /// the adapter opted into the editing capability (fail closed otherwise).
     var editingObject: DatabaseObject? {
         guard let session = selectedSession,
               !session.profile.readOnly,
+              !session.profile.demo,
               let object = previewedObject,
               object.kind == .table || object.kind == .collection,
               session.adapter is any SupportsEditing
@@ -350,18 +438,19 @@ final class SessionStore {
             errorMessage = "This connection does not support editing records."
             return false
         }
+        let connectionID = session.id
         errorMessage = nil
         isApplyingChange = true
         defer { isApplyingChange = false }
         do {
             _ = try await adapter.applyDataChange(change)
-            if let object = previewedObject {
+            if let object = previewedObject, selectedConnectionID == connectionID {
                 result = try await adapter.previewObject(object)
             }
             return true
-        } catch is CancellationError {
-            return false
         } catch {
+            if Self.isCancellation(error) { return false }
+            guard selectedConnectionID == connectionID else { return false }
             errorMessage = Self.redactedMessage(for: error)
             return false
         }
@@ -447,6 +536,7 @@ final class SessionStore {
     /// becomes a banner error, never a write. Progress and cancellation are
     /// wired through the request closures.
     func startImport(format: ImportFormat, fileURL: URL, hasHeader: Bool) {
+        guard !isImporting else { return }
         guard let session = selectedSession,
               !session.profile.readOnly,
               !session.profile.demo,
@@ -462,6 +552,7 @@ final class SessionStore {
         importSummary = nil
         let flag = importCancelFlag
         flag.reset()
+        let progressRelay = ImportProgressRelay()
         importTask = Task { @MainActor in
             defer {
                 isImporting = false
@@ -475,19 +566,21 @@ final class SessionStore {
                     fileURL: fileURL,
                     hasHeader: hasHeader,
                     isCancelled: { flag.isSet },
-                    onProgress: { progress in
-                        Task { @MainActor [weak self] in
-                            self?.importProgress = progress
+                    onProgress: { [weak self] progress in
+                        progressRelay.send(progress) { [weak self] latest in
+                            self?.importProgress = latest
                         }
                     }))
                 importSummary = summary
                 // Refresh the preview so the imported rows are visible.
-                if let object = previewedObject {
+                if let object = previewedObject, selectedConnectionID == session.id {
                     result = try? await adapter.previewObject(object)
                 }
             } catch {
                 importSummary = nil
-                errorMessage = Self.redactedMessage(for: error)
+                if !Self.isCancellation(error) {
+                    errorMessage = Self.redactedMessage(for: error)
+                }
             }
         }
     }
@@ -544,13 +637,13 @@ final class SessionStore {
 
     func removeQueryEntry(_ id: UUID) {
         guard let queryLibrary else { return }
-        queryLibrary.remove(id: id)
+        queryLibrary.remove(id: id) { errorMessage = Self.redactedMessage(for: $0) }
         queryEntries = queryLibrary.entries
     }
 
     func clearQueryHistory() {
         guard let queryLibrary else { return }
-        queryLibrary.clearHistory()
+        queryLibrary.clearHistory { errorMessage = Self.redactedMessage(for: $0) }
         queryEntries = queryLibrary.entries
     }
 
@@ -559,6 +652,19 @@ final class SessionStore {
     static func redactedMessage(for error: Error) -> String {
         if let error = error as? dbbbbError { return error.userMessage }
         return "The operation failed."
+    }
+
+    /// Adapters surface cancellation as their own error types (one per
+    /// engine), not necessarily `CancellationError`; none of them may reach
+    /// the error banner. Every engine's cancelled message contains
+    /// "cancelled"; `cancellationUnsupported` ("cannot cancel") deliberately
+    /// does not match.
+    static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let error = error as? dbbbbError {
+            return error.userMessage.localizedCaseInsensitiveContains("cancelled")
+        }
+        return false
     }
 
     // MARK: Private
@@ -575,18 +681,20 @@ final class SessionStore {
             do {
                 let loaded = try await adapter.listObjects()
                 // Ignore stale loads after the user switched connections.
-                guard selectedConnectionID == connectionID else { return }
+                guard selectedConnectionID == connectionID else {
+                    isLoadingObjects = false
+                    return
+                }
                 objects = loaded
                 isLoadingObjects = false
                 // Offer a runnable starter query once the schema is known.
                 if queryText.isEmpty, let engine = selectedSession?.profile.engine {
                     queryText = Self.defaultQuery(for: engine, objects: loaded)
                 }
-            } catch is CancellationError {
-                isLoadingObjects = false
             } catch {
-                guard selectedConnectionID == connectionID else { return }
                 isLoadingObjects = false
+                guard !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID else { return }
                 errorMessage = Self.redactedMessage(for: error)
             }
         }

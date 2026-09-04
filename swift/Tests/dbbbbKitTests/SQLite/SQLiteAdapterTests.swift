@@ -62,6 +62,16 @@ final class SQLiteAdapterTests: XCTestCase {
         }
     }
 
+    func testOpenIsDeferredUntilFirstUse() async throws {
+        let fixture = SQLiteFixture()
+        let adapter = try fixture.makeAdapter()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.path),
+                       "init must not open the SQLite file")
+        _ = try await adapter.listObjects()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path),
+                      "first use must open the SQLite file")
+    }
+
     func testProfile() throws {
         let fixture = try SQLiteFixture().populate(["CREATE TABLE t (x INTEGER)"])
         let adapter = try fixture.makeAdapter(readOnly: true)
@@ -180,6 +190,19 @@ final class SQLiteAdapterTests: XCTestCase {
         let result = try await adapter.execute(.sql("SELECT 1 AS x, 2 AS x, 3 AS x"), options: ExecuteOptions())
         guard case .rows(let columns, _, _) = result else { return XCTFail("expected rows") }
         XCTAssertEqual(columns.map(\.name), ["x", "x:1", "x:2"])
+    }
+
+    func testNonFiniteDoublesRenderAsStrings() {
+        // SQLite folds NaN to NULL in query results, so NaN rendering is
+        // exercised at the conversion boundary, not through SQL.
+        XCTAssertEqual(SQLiteAdapter.displayValue(for: Double.nan.databaseValue),
+                       .string("NaN"))
+        XCTAssertEqual(SQLiteAdapter.displayValue(for: Double.infinity.databaseValue),
+                       .string("Infinity"))
+        XCTAssertEqual(SQLiteAdapter.displayValue(for: (-Double.infinity).databaseValue),
+                       .string("-Infinity"))
+        XCTAssertEqual(SQLiteAdapter.displayValue(for: 1.5.databaseValue),
+                       .number(1.5))
     }
 
     // MARK: - Budgets
@@ -366,6 +389,38 @@ final class SQLiteAdapterTests: XCTestCase {
             let message = (error as? dbbbbError)?.userMessage ?? error.localizedDescription
             XCTAssertTrue(message.contains("interrupt"), "unexpected error: \(message)")
         }
+    }
+
+    func testTimeoutInterruptsLongQuery() async throws {
+        let fixture = try SQLiteFixture().populate(["CREATE TABLE t (x INTEGER)"])
+        let adapter = try fixture.makeAdapter()
+        // Same shape as testCancelInterruptsRunningQuery: only the watchdog's
+        // interrupt stops this query, and it must surface as a timeout.
+        let sql = """
+            WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 100000000)
+            SELECT sum(x) FROM c
+            """
+
+        do {
+            _ = try await adapter.execute(
+                .sql(sql), options: ExecuteOptions(timeout: .milliseconds(300)))
+            XCTFail("the query should have timed out")
+        } catch let error as SQLiteAdapterError {
+            XCTAssertEqual(error.userMessage, "SQLite query timed out.")
+        }
+
+        // The watchdog must not poison the queue: follow-up queries run.
+        guard case .rows = try await adapter.execute(.sql("SELECT 1"), options: ExecuteOptions())
+        else { return XCTFail("the queue must stay usable after a timeout") }
+    }
+
+    func testFastQueryBeatsTheWatchdog() async throws {
+        let fixture = try SQLiteFixture().populate(["CREATE TABLE t (x INTEGER)"])
+        let adapter = try fixture.makeAdapter()
+        guard case .rows(_, let rows, _) = try await adapter.execute(
+            .sql("SELECT 42"), options: ExecuteOptions(timeout: .seconds(5))
+        ) else { return XCTFail("expected rows") }
+        XCTAssertEqual(rows[0][0], .number(42))
     }
 
     // MARK: - Close

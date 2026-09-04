@@ -120,6 +120,53 @@ final class MySQLAdapterIntegrationTests: XCTestCase {
         }
     }
 
+    /// sslMode=require must never silently degrade to plaintext: a TLS-capable
+    /// server negotiates real encryption (proven via Ssl_cipher before the
+    /// session serves queries); a server without SSL is refused fail-closed.
+    func testRequireTLSNeverSilentlyDegradesToPlaintext() async throws {
+        var input = try makeInput()
+        input.sslMode = .require
+        let adapter = try MySQLAdapter(input: input)
+        addTeardownBlock {
+            await adapter.close()
+        }
+        do {
+            _ = try await adapter.execute(.sql("SELECT 1"), options: ExecuteOptions())
+        } catch let error as MySQLAdapterError {
+            XCTAssertEqual(error, .tlsRequired)
+        }
+    }
+
+    /// A large result set stops accumulating at maxRows + 1 rows; the rest of
+    /// the packets are drained and dropped.
+    func testLargeResultSetStaysWithinRowBudget() async throws {
+        let adapter = try makeAdapter()
+        _ = try await adapter.execute(.sql("DROP TABLE IF EXISTS dbbbb_it_budget"),
+                                      options: ExecuteOptions())
+        _ = try await adapter.execute(.sql("""
+            CREATE TABLE dbbbb_it_budget (id INT PRIMARY KEY AUTO_INCREMENT, note VARCHAR(20))
+            """), options: ExecuteOptions())
+        addTeardownBlock {
+            _ = try? await adapter.execute(
+                .sql("DROP TABLE IF EXISTS dbbbb_it_budget"), options: ExecuteOptions())
+        }
+        _ = try await adapter.execute(.sql("""
+            INSERT INTO dbbbb_it_budget (note)
+            SELECT 'x' FROM information_schema.COLUMNS c1
+            CROSS JOIN information_schema.COLUMNS c2
+            LIMIT 5000
+            """), options: ExecuteOptions(timeout: .seconds(30)))
+
+        let result = try await adapter.execute(
+            .sql("SELECT id, note FROM dbbbb_it_budget"),
+            options: ExecuteOptions(timeout: .seconds(30), maxRows: 50))
+        guard case .rows(_, let rows, let meta) = result else {
+            return XCTFail("expected rows result")
+        }
+        XCTAssertEqual(rows.count, 50)
+        XCTAssertTrue(meta.truncated)
+    }
+
     func testReadOnlyRejectsWrites() async throws {
         let adapter = try makeAdapter(readOnly: true)
         await XCTAssertReadOnlyError("CREATE TABLE dbbbb_ro_test (a INT)", adapter)
@@ -308,6 +355,75 @@ final class MySQLAdapterIntegrationTests: XCTestCase {
         XCTAssertEqual(updated["payload"], original["payload"])
         XCTAssertEqual(updated["flag"], .bool(false))
         XCTAssertEqual(updated["note"], .string("edited"))
+    }
+
+    /// Byte-level lock proof against real collation semantics: under the
+    /// default `utf8mb4_0900_ai_ci` a concurrent case-only rewrite is
+    /// invisible to native `<=>`, so it must surface as an
+    /// optimistic-concurrency conflict; the untouched row still edits cleanly.
+    func testApplyDataChangeDetectsCaseOnlyConcurrentRewrite() async throws {
+        let adapter = try makeAdapter()
+        let external = try makeAdapter()
+        _ = try await adapter.execute(.sql("DROP TABLE IF EXISTS dbbbb_it_edit_ci"),
+                                      options: ExecuteOptions())
+        _ = try await adapter.execute(.sql("""
+            CREATE TABLE dbbbb_it_edit_ci (
+                id INT PRIMARY KEY,
+                code VARCHAR(100),
+                note VARCHAR(100)
+            )
+            """), options: ExecuteOptions())
+        addTeardownBlock {
+            _ = try? await adapter.execute(
+                .sql("DROP TABLE IF EXISTS dbbbb_it_edit_ci"), options: ExecuteOptions())
+        }
+        _ = try await adapter.execute(.sql(
+            "INSERT INTO dbbbb_it_edit_ci VALUES (1, 'ABC', 'keep')"),
+            options: ExecuteOptions())
+
+        let table = try await editingTable(adapter, name: "dbbbb_it_edit_ci")
+        let (columns, previewRows) = try rows(try await adapter.previewObject(table))
+        guard let row = previewRows.first(where: { $0[0] == .number(1) }) else {
+            return XCTFail("inserted row missing from preview")
+        }
+        let original = originalRecord(columns: columns, row: row)
+        XCTAssertEqual(original["code"], .string("ABC"))
+
+        // Control: the untouched row edits cleanly under the byte-level lock.
+        _ = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: original,
+            operation: .update(changed: ["note": .string("edited")])))
+
+        // A concurrent case-only rewrite (equal under ai_ci) must conflict.
+        let (staleColumns, staleRows) = try rows(try await adapter.previewObject(table))
+        let stale = originalRecord(columns: staleColumns, row: staleRows[0])
+        _ = try await external.execute(.sql(
+            "UPDATE dbbbb_it_edit_ci SET code = 'abc' WHERE id = 1"),
+            options: ExecuteOptions())
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table,
+                original: stale,
+                operation: .update(changed: ["note": .string("touched")])))
+            XCTFail("case-only rewrite under utf8mb4_0900_ai_ci must conflict")
+        } catch let error as MySQLAdapterError {
+            XCTAssertTrue(error.userMessage.contains("optimistic-concurrency conflict"),
+                          error.userMessage)
+        }
+
+        // Stale deletes conflict too, and the externally rewritten row survives.
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table, original: stale, operation: .delete))
+            XCTFail("stale delete under utf8mb4_0900_ai_ci must conflict")
+        } catch let error as MySQLAdapterError {
+            XCTAssertTrue(error.userMessage.contains("optimistic-concurrency conflict"),
+                          error.userMessage)
+        }
+        let (_, remaining) = try rows(try await adapter.execute(.sql(
+            "SELECT code FROM dbbbb_it_edit_ci WHERE id = 1"), options: ExecuteOptions()))
+        XCTAssertEqual(remaining.first?.first, .string("abc"))
     }
 
     func testApplyDataChangeRejectsReadOnlyAndUnknownTargets() async throws {

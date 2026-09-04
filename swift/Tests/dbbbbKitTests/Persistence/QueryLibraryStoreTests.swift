@@ -96,6 +96,23 @@ final class QueryLibraryStoreTests: XCTestCase {
         }
     }
 
+    /// The 32 KB limit counts UTF-8 bytes, not grapheme clusters: 9 000 emoji
+    /// are few characters but 36 000 bytes and must be rejected.
+    func testTextLimitCountsUTF8Bytes() throws {
+        let store = makeStore()
+        let overLimit = String(repeating: "😀", count: QueryLibraryStore.maxTextLength / 4 + 1)
+        XCTAssertLessThanOrEqual(overLimit.count, QueryLibraryStore.maxTextLength)
+        XCTAssertGreaterThan(overLimit.utf8.count, QueryLibraryStore.maxTextLength)
+        XCTAssertThrowsError(try store.record(connectionID: connectionA, engine: .sqlite, text: overLimit)) {
+            XCTAssertEqual($0 as? QueryLibraryError, .invalidText)
+        }
+
+        let atLimit = String(repeating: "😀", count: QueryLibraryStore.maxTextLength / 4)
+        XCTAssertEqual(atLimit.utf8.count, QueryLibraryStore.maxTextLength)
+        let entry = try store.record(connectionID: connectionA, engine: .sqlite, text: atLimit)
+        XCTAssertEqual(entry.text, atLimit)
+    }
+
     // MARK: - History cap and favorites
 
     func testHistoryIsCappedAtOneHundred() throws {
@@ -166,6 +183,38 @@ final class QueryLibraryStoreTests: XCTestCase {
         XCTAssertEqual(store.entries[0].id, keep.id)
     }
 
+    /// Persistence failures are surfaced through `onPersistError`, not
+    /// swallowed: the in-memory mutation stands, the caller sees the error.
+    func testRemoveReportsPersistFailure() throws {
+        let store = makeStore()
+        let entry = try store.record(connectionID: connectionA, engine: .sqlite, text: "select 1;")
+        try replaceDirectoryWithFile()
+
+        var reported: (any Error)?
+        let removed = store.remove(id: entry.id) { reported = $0 }
+        XCTAssertTrue(removed)
+        XCTAssertNotNil(reported)
+        XCTAssertEqual(store.entries.count, 0)
+    }
+
+    func testClearHistoryReportsPersistFailure() throws {
+        let store = makeStore()
+        _ = try store.record(connectionID: connectionA, engine: .sqlite, text: "select 1;")
+        try replaceDirectoryWithFile()
+
+        var reported: (any Error)?
+        store.clearHistory { reported = $0 }
+        XCTAssertNotNil(reported)
+        XCTAssertEqual(store.entries.count, 0)
+    }
+
+    /// After this, writes into the store's directory fail: a regular file
+    /// occupies the directory's path.
+    private func replaceDirectoryWithFile() throws {
+        try FileManager.default.removeItem(at: directory)
+        try Data().write(to: directory)
+    }
+
     // MARK: - Persistence
 
     func testPersistenceRoundTrip() throws {
@@ -192,16 +241,40 @@ final class QueryLibraryStoreTests: XCTestCase {
         try store.record(connectionID: connectionA, engine: .sqlite, text: "select 1;")
         XCTAssertEqual(store.entries.count, 1)
         XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), foreign)
+        XCTAssertTrue(try corruptBackups().isEmpty, "a foreign-version file is never renamed")
     }
 
-    func testCorruptFileIsRewritable() throws {
+    func testCorruptFileIsBackedUpThenRewritable() throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try "{ broken".write(to: fileURL, atomically: false, encoding: .utf8)
 
         let store = makeStore()
         XCTAssertTrue(store.entries.isEmpty)
+        // The corrupt original is quarantined before any rewrite, never lost.
+        let backups = try corruptBackups()
+        XCTAssertEqual(backups.count, 1)
+        XCTAssertEqual(try String(contentsOf: backups[0], encoding: .utf8), "{ broken")
+
         try store.record(connectionID: connectionA, engine: .sqlite, text: "select 1;")
         XCTAssertEqual(makeStore().entries.count, 1)
+        XCTAssertEqual(try corruptBackups().count, 1, "the backup survives the rewrite")
+    }
+
+    func testMissingVersionKeyIsBackedUpThenRewritable() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try #"{"entries": []}"#.write(to: fileURL, atomically: false, encoding: .utf8)
+
+        let store = makeStore()
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertEqual(try corruptBackups().count, 1)
+        try store.record(connectionID: connectionA, engine: .sqlite, text: "select 1;")
+        XCTAssertEqual(makeStore().entries.count, 1)
+    }
+
+    private func corruptBackups() throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("query-library.json.corrupt-") }
+            .map { directory.appendingPathComponent($0) }
     }
 
     func testLoadDropsInvalidEntriesAndSortsNewestFirst() throws {
