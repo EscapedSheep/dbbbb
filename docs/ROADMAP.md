@@ -4,7 +4,7 @@
 > 定位边界（不可越）：calm、local-first，"打开连接、定位数据、安全地做审慎修改"。
 > **不做**：ER 图、可视化建表/改表向导、schema diff/迁移生成、数据生成器、用户权限管理、AI 功能、Oracle/SQL Server。
 > 工程纪律：每个特性含单测 + SessionStore 测试（env 门控集成测试能写则写）；`swift build` 零警告（编译强制）；错误脱敏（`dbbbbError.userMessage` 边界）；可选能力一律 fail-closed；标识符 quoting 沿用各引擎现有规则。
-> **状态（2026-09-05）：M1 ①②③④⑤ 与 M2 ⑥⑦⑧⑨⑩ 全部完成并验证（753 测试全绿 = 505 XCTest + 248 Swift Testing，零警告）。M3 仍为缓议。**
+> **状态（2026-09-08）：M1、M2、M3 全部完成并验证（零警告；319 Swift Testing + XCTest 全套全绿）。另新增 Schema 查看器（表结构 + 全库外键关系总览，PG/MySQL/SQLite，用户拍板）。仅剩"schema 感知自动补全"缓议。**
 
 ## 分期概览
 
@@ -12,7 +12,7 @@
 |---|---|---|---|
 | M1 浏览与编辑闭环 | ①preview 翻页 ②网格过滤/排序 ③INSERT 新行/复制行 ④对象快速搜索 ⑤外键跳转 | v0.4.0 | ✅ 完成（2026-09-05） |
 | M2 效率与可观测 | ⑥行详情侧栏 ⑦导出/复制为 INSERT ⑧EXPLAIN 查看器 ⑨进程列表+kill ⑩表统计 | v0.5.0 | ✅ 完成（2026-09-05） |
-| M3 缓议 | 多结果标签、值编辑器、批量编辑暂存、查询格式化 | 待拍板 |
+| M3 工作区增强 | 多结果标签、值编辑器、批量编辑暂存、查询格式化 | v0.4.0 | ✅ 完成（2026-09-08） |
 | 明确缓议 | schema 感知自动补全（工程量最大，与"轻"定位冲突，单独评估后再定） | — |
 
 ---
@@ -85,12 +85,12 @@
 
 ---
 
-## M3 · 缓议（做了再拍板，本计划不含排期）
+## M3 · 工作区增强（2026-09-08 用户拍板实施，已全部完成）
 
-- 多结果标签页：SessionStore 状态模型从单 result 改多 tab，牵动面大，M2 后评估。
-- 值编辑器（多行文本/JSON/blob hex 弹窗编辑）：依赖⑥的展示层先做。
-- 批量编辑暂存（多行改动一次提交）：与"审慎修改"契合，但 DataChange 需支持批量复核流，待 INSERT 上线后看真实 usage。
-- 查询格式化：引入 SQL formatter 依赖或自写，价值/重量比一般。
+- 多结果标签页：SessionStore 状态移入 `QueryTab`（每 tab 独立 queryText/result/翻页过滤/暂存/在飞簿记），SessionStore 以计算属性转发到活动 tab 保持既有 API 与测试零改动；逐 tab 取消，切连接全清。
+- 值编辑器（多行文本/JSON/blob hex 弹窗编辑）：`ValueEditorSheet` + 纯函数 `ValueEditing`；JSON 只校验不改写、binary 走 hex；截断值拒绝编辑；提交走既有 DataChange 管线。
+- 批量编辑暂存：`PendingChange` 暂存清单 + `BatchReviewSheet` 集中复核；顺序应用、首个失败即停并如实报告部分成功；切连接/切对象清空并提示，刷新保留。
+- 查询格式化：自写方言无关 tokenizer + 重排（`SQLFormatter`），逐字保留 token，自检不一致即回退原文；⇧⌘F；Mongo fail-closed。
 - Schema 感知自动补全：明确缓议。需要解析器+目录缓存+补全 UI，是把 app 做"重"的分水岭，要做必须单独评审。
 
 ## 实施顺序与验收

@@ -14,6 +14,17 @@ dbbbb is a local-first, open-source macOS database client for PostgreSQL, MySQL,
 - Real connections to all four engines. PostgreSQL, MySQL support `disable`, `require`, and `verify-full` SSL modes; MongoDB supports SRV URIs with TLS enforced. SQLite opens local database files, optionally read-only.
 - Object browsing, generated previews, and query execution with bounded results (500 rows / 5 MiB per result, 8 MiB per single value with an explicit truncation marker), targeted cancellation, and redacted error messages that never leak passwords, URIs, or local paths. Double-click a table or view to run its `SELECT … LIMIT 100` instantly (a MongoDB collection runs its find).
 - View Create Statement for tables and views on PostgreSQL, MySQL, and SQLite: the DDL opens read-only in a monospaced, copyable sheet (a fail-closed capability — MongoDB and unsupported adapters never show it).
+- Preview paging and grid filtering/sorting: page through large tables (100 rows per page), click column headers to cycle sort, and filter any column by substring or exact match — server-side and parameterized on the SQL engines, native sort/regex on MongoDB.
+- Quick object search (⌘F) filters the object tree while keeping the ancestor chains of matches expanded.
+- Insert new rows or duplicate existing ones through the same reviewed pipeline as edits, with server defaults honored for omitted columns.
+- Foreign-key jump: right-click a row on a foreign-key column to open the referenced row (PostgreSQL, MySQL, SQLite; multi-column and cross-schema keys supported).
+- Row detail pane with JSON pretty-printing, binary hex display, and explicit truncation markers; copy or export the current result as INSERT statements.
+- Observability: EXPLAIN viewer, table statistics (estimated rows, table/index sizes), and a server activity list with kill (PostgreSQL, MySQL, MongoDB).
+- Schema viewer (PostgreSQL, MySQL, SQLite): every table's columns, primary keys, indexes, and foreign keys, plus a database-wide overview of table relationships.
+- Value editor sheet for long text, JSON (validated, never rewritten), and binary (hex) values — truncated values are refused rather than silently overwritten.
+- Staged batch editing: accumulate multiple row changes, review them together, and apply them as one batch that stops at the first failure and reports partial progress honestly.
+- Multiple query tabs, each with its own query text, result, paging/filter state, staged changes, and independent cancellation.
+- Conservative SQL formatting (⇧⌘F): a dialect-agnostic reindenter that preserves every token verbatim and falls back to the original text if its self-check finds any mismatch. MongoDB is fail-closed.
 - Optional database field: PostgreSQL falls back to the `postgres` maintenance database; MySQL connects without a default schema and browses all non-system schemas server-wide.
 - Read-only connections enforced twice: a client-side statement classifier plus server-side read-only settings.
 - Reviewed single-record update/delete on all four engines: draft → review two-phase flow, optimistic conflict detection, and an extra typed confirmation on production profiles. Editing is a fail-closed capability — read-only profiles, non-preview results, or unsupported adapters simply never show edit entry points.
