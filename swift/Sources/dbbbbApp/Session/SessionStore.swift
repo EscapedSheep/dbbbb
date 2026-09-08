@@ -890,6 +890,47 @@ final class SessionStore {
             insertPrefill: prefill)
     }
 
+    // MARK: - Value editor (ROADMAP M3)
+
+    /// The single-field review a value-editor commit produces (row-detail
+    /// pane or grid): the whole visible row is the optimistic-concurrency
+    /// baseline, only the edited column changes, and the review sheet still
+    /// runs (production gate included) before `applyDataChange` — the exact
+    /// pipeline of a cell edit. Fails closed (nil) when the session may not
+    /// edit this preview, the column is unknown, the value is unchanged, or
+    /// the held value is adapter-truncated: the app does not hold its full
+    /// bytes, so committing the visible prefix would silently overwrite the
+    /// unseen tail.
+    func valueEditReview(
+        column: String,
+        newValue: DisplayValue,
+        columns: [ColumnMeta],
+        row: [(key: String, value: DisplayValue)]
+    ) -> RecordReview? {
+        guard let object = editingObject, let session = selectedSession,
+              let before = row.first(where: { $0.key == column })?.value,
+              before != newValue
+        else { return nil }
+        switch before {
+        case .string(let text) where DisplayFormatting.truncatedOmittedBytes(of: text) != nil:
+            return nil
+        case .binary(let data) where DisplayFormatting.binaryTruncationSplit(data) != nil:
+            return nil
+        default:
+            break
+        }
+        let draft = RecordDraft(
+            object: object,
+            environment: session.profile.environment,
+            columns: columns,
+            original: row)
+        return RecordReview(
+            draft: draft,
+            changes: [(column, before, newValue)],
+            changed: [column: newValue],
+            isDelete: false)
+    }
+
     // MARK: - Result export
 
     /// Non-nil when there is a result to export. Export works off the

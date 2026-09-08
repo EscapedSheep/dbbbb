@@ -190,6 +190,11 @@ struct RowsTableView: View {
 
     @State private var selection = Set<Int>()
     @State private var editingState: RecordEditingState?
+    /// The value-editor popup's target (ROADMAP M3 值编辑器).
+    @State private var valueEdit: ValueEditTarget?
+    /// The review a value-editor commit produced; presented from the popup's
+    /// `onDismiss` so the two sheets chain cleanly.
+    @State private var pendingValueReview: RecordReview?
     @State private var showsRowDetail = true
 
     private var models: [RowModel] {
@@ -234,7 +239,10 @@ struct RowsTableView: View {
                         columns: columns,
                         row: selectedRow,
                         selectionCount: selection.count,
-                        onCollapse: { showsRowDetail = false }
+                        onCollapse: { showsRowDetail = false },
+                        onEditValue: store.editingObject == nil
+                            ? nil
+                            : { columnIndex in beginValueEdit(columnIndex: columnIndex) }
                     )
                     .frame(width: 300)
                 } else {
@@ -244,7 +252,52 @@ struct RowsTableView: View {
             .sheet(item: $editingState) { _ in
                 RecordEditingSheet(state: $editingState)
             }
+            .sheet(item: $valueEdit, onDismiss: presentPendingValueReview) { target in
+                ValueEditorSheet(
+                    column: columns[target.columnIndex].name,
+                    kind: target.kind,
+                    initialText: ValueEditing.initialText(for: target.value, kind: target.kind),
+                    onCommit: { newValue in
+                        pendingValueReview = store.valueEditReview(
+                            column: columns[target.columnIndex].name,
+                            newValue: newValue,
+                            columns: columns,
+                            row: zip(columns, target.row.values).map { ($0.0.name, $0.1) })
+                    })
+            }
         }
+    }
+
+    /// One cell open in the popup value editor.
+    struct ValueEditTarget: Identifiable {
+        let id = UUID()
+        let columnIndex: Int
+        let kind: ValueEditKind
+        let value: DisplayValue
+        let row: RowModel
+    }
+
+    /// Opens the value editor for one detail-pane cell. Fails closed: only a
+    /// singly-selected row of an editable preview, a complete (untruncated)
+    /// value, and a kind the editor supports may open it.
+    private func beginValueEdit(columnIndex: Int) {
+        guard let row = selectedRow,
+              columnIndex < row.values.count, columnIndex < columns.count
+        else { return }
+        let value = row.values[columnIndex]
+        let item = RowDetailItem.make(
+            index: columnIndex, column: columns[columnIndex].name, value: value)
+        guard item.isValueEditable, let kind = ValueEditing.kind(for: value) else { return }
+        valueEdit = ValueEditTarget(columnIndex: columnIndex, kind: kind, value: value, row: row)
+    }
+
+    /// After the value editor closes: a committed edit flows into the standard
+    /// review sheet (production gate and `applyDataChange` included); a
+    /// cancelled or gated-out edit leaves nothing pending.
+    private func presentPendingValueReview() {
+        guard let review = pendingValueReview else { return }
+        pendingValueReview = nil
+        editingState = .reviewing(review)
     }
 
     /// Slim right-edge affordance to reopen the collapsed row-detail pane.

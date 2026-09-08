@@ -72,6 +72,19 @@ struct RowDetailItem: Identifiable, Equatable {
 
     var isCollapsible: Bool { fullText != collapsedText }
 
+    /// Whether the value editor may open on this item (ROADMAP M3 值编辑器):
+    /// only complete values — an adapter-truncated value is never edited
+    /// because the app does not hold its full bytes, so a commit would
+    /// silently overwrite the untruncated tail with the visible prefix.
+    /// null/number/bool cells use the plain record-editor fields instead.
+    var isValueEditable: Bool {
+        guard truncatedOmittedBytes == nil else { return false }
+        switch kind {
+        case .text, .json, .binary: return true
+        case .null, .number, .bool: return false
+        }
+    }
+
     static func items(columns: [ColumnMeta], values: [DisplayValue]) -> [RowDetailItem] {
         columns.enumerated().map { index, column in
             make(index: index, column: column.name,

@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import dbbbbCore
 import dbbbbKit
@@ -21,8 +22,7 @@ enum RecordEditingState: Identifiable {
 
 /// A record open for editing. `original` is the optimistic-concurrency
 /// baseline — the values exactly as displayed.
-struct RecordDraft: Identifiable {
-    let id = UUID()
+struct RecordDraft: Identifiable {    let id = UUID()
     let object: DatabaseObject
     let environment: ConnectionEnvironment
     /// Result columns for tabular rows; empty for MongoDB documents.
@@ -73,6 +73,13 @@ private struct RecordDraftError: dbbbbError {
     init(_ message: String) { userMessage = message }
 }
 
+/// One field currently open in the popup value editor (ROADMAP M3 值编辑器).
+struct FieldEditTarget: Identifiable {
+    let id = UUID()
+    let index: Int
+    let kind: ValueEditKind
+}
+
 /// The editing sheet: draft phase and review phase in one container so the
 /// edit → review transition does not re-present.
 struct RecordEditingSheet: View {
@@ -106,6 +113,11 @@ private struct RecordDraftEditor: View {
 
     @State private var texts: [String]
     @State private var nulls: [Bool]
+    /// Hex-popup edits of binary fields, by field index. Unedited binary
+    /// seeds keep their existing behavior (omitted from inserts, unchanged
+    /// in updates); an edited value crosses as `.binary` bytes.
+    @State private var binaryEdits: [Int: Data] = [:]
+    @State private var fieldEdit: FieldEditTarget?
     @State private var documentText: String
     @State private var error: String?
 
@@ -178,11 +190,39 @@ private struct RecordDraftEditor: View {
                 }
                 Form {
                     ForEach(Array(fields.enumerated()), id: \.offset) { index, field in
-                        if Self.isEditable(field.value) {
+                        if case .binary(let data) = field.value {
+                            LabeledContent(field.key) {
+                                HStack(spacing: 8) {
+                                    Text(binarySummary(index: index, original: data))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                    Button {
+                                        fieldEdit = FieldEditTarget(index: index, kind: .binary)
+                                    } label: {
+                                        Image(systemName: "square.and.pencil")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .disabled(nulls[index])
+                                    .help("Edit as hex")
+                                    Toggle("NULL", isOn: $nulls[index])
+                                        .toggleStyle(.checkbox)
+                                }
+                            }
+                        } else if Self.isEditable(field.value) {
                             LabeledContent(field.key) {
                                 HStack(spacing: 8) {
                                     TextField("", text: $texts[index])
                                         .disabled(nulls[index])
+                                    Button {
+                                        fieldEdit = FieldEditTarget(
+                                            index: index,
+                                            kind: ValueEditing.kind(for: field.value) ?? .text)
+                                    } label: {
+                                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .disabled(nulls[index])
+                                    .help("Edit in a larger editor (multi-line / JSON)")
                                     Toggle("NULL", isOn: $nulls[index])
                                         .toggleStyle(.checkbox)
                                 }
@@ -210,6 +250,45 @@ private struct RecordDraftEditor: View {
             .padding(12)
         }
         .frame(minWidth: 480, idealWidth: 560, minHeight: 380)
+        .sheet(item: $fieldEdit) { target in
+            ValueEditorSheet(
+                column: fields[target.index].key,
+                kind: target.kind,
+                initialText: popupInitialText(for: target),
+                onCommit: { commitFieldEdit(target: target, value: $0) })
+        }
+    }
+
+    /// The popup's seed content: the field's current text for text/JSON
+    /// (keeping anything the user already typed inline), the edited or
+    /// original bytes as hex for binary.
+    private func popupInitialText(for target: FieldEditTarget) -> String {
+        let field = fields[target.index]
+        if target.kind == .binary, case .binary(let data) = field.value {
+            return DisplayFormatting.hexText(binaryEdits[target.index] ?? data)
+        }
+        return texts[target.index]
+    }
+
+    /// The popup's commit lands back in the draft state — the actual write
+    /// still goes through Review/Apply. Text/JSON cross as the verbatim
+    /// string; binary as decoded bytes.
+    private func commitFieldEdit(target: FieldEditTarget, value: DisplayValue) {
+        switch value {
+        case .string(let text):
+            texts[target.index] = text
+        case .binary(let data):
+            binaryEdits[target.index] = data
+        default:
+            break
+        }
+    }
+
+    private func binarySummary(index: Int, original: Data) -> String {
+        if let edited = binaryEdits[index] {
+            return "<\(edited.count) bytes> (edited)"
+        }
+        return "<\(original.count) bytes>"
     }
 
     private func review() {
@@ -278,7 +357,20 @@ private struct RecordDraftEditor: View {
     private func makeRowReview() throws -> RecordReview {
         var changes: [(key: String, before: DisplayValue?, after: DisplayValue)] = []
         var changed: [String: DisplayValue] = [:]
-        for (index, field) in draft.original.enumerated() where Self.isEditable(field.value) {
+        for (index, field) in draft.original.enumerated() {
+            if case .binary = field.value {
+                // Binary fields edit through the hex popup; the NULL toggle
+                // clears the column. Unedited binary stays unchanged.
+                let after: DisplayValue = nulls[index]
+                    ? .null
+                    : (binaryEdits[index].map(DisplayValue.binary) ?? field.value)
+                if after != field.value {
+                    changes.append((field.key, field.value, after))
+                    changed[field.key] = after
+                }
+                continue
+            }
+            guard Self.isEditable(field.value) else { continue }
             let after = try Self.parseValue(
                 text: texts[index], isNull: nulls[index],
                 original: field.value, field: field.key)
@@ -333,6 +425,19 @@ private struct RecordDraftEditor: View {
         var changed: [String: DisplayValue] = [:]
         var omitted: [String] = []
         for (index, field) in fields.enumerated() {
+            if case .binary = field.value {
+                // Only a hex-edited binary inserts; an unedited binary seed
+                // (e.g. a duplicated blob) keeps its existing behavior and
+                // the fresh row takes the column default.
+                guard !nulls[index], let data = binaryEdits[index] else {
+                    omitted.append(field.key)
+                    continue
+                }
+                let value = DisplayValue.binary(data)
+                changes.append((field.key, nil, value))
+                changed[field.key] = value
+                continue
+            }
             guard Self.isEditable(field.value), !nulls[index] else {
                 omitted.append(field.key)
                 continue
