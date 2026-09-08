@@ -15,6 +15,8 @@ struct QueryWorkspaceView: View {
                 )
             } else {
                 VStack(spacing: 0) {
+                    QueryTabBar()
+                    Divider()
                     if let message = store.errorMessage {
                         ErrorBanner(message: message) { store.errorMessage = nil }
                         Divider()

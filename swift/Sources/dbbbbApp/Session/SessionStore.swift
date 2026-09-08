@@ -71,32 +71,10 @@ final class SessionStore {
     /// The object the user last clicked or previewed; MongoDB queries run
     /// against it (the editor text is pure Extended JSON).
     private(set) var selectedObject: DatabaseObject?
-    /// The object whose preview is currently shown; nil after ad-hoc queries.
-    /// Editing is offered only for previews — ad-hoc results have no known
-    /// single change target.
-    private(set) var previewedObject: DatabaseObject?
-    /// Paging/sort/filter state of the visible preview (ROADMAP M1 ①②).
-    /// Zeroed when the object, connection, or object list is refreshed; an
-    /// edit- or import-triggered re-preview keeps the current page.
-    private(set) var previewOffset = 0
-    private(set) var previewSort: PreviewRequest.Sort?
-    private(set) var previewFilter: PreviewRequest.Filter?
-    /// Exact-match predicates set by a foreign-key jump (ROADMAP M1 ⑤);
-    /// carried on every page turn until the object changes.
-    private(set) var previewEqualities: [PreviewRequest.Equality] = []
-    /// Foreign keys of the previewed object, fetched after each successful
-    /// preview when the adapter conforms to `SupportsForeignKeys`; empty for
-    /// ad-hoc results and non-conforming adapters (fail closed).
-    private(set) var previewedForeignKeys: [ForeignKey] = []
     private(set) var isLoadingObjects = false
-    var queryText = ""
-    /// Find vs. aggregate for MongoDB connections; the editor text is the
-    /// filter document or the pipeline array respectively. SQL engines ignore it.
-    var mongoQueryMode: MongoQueryMode = .find
-    private(set) var result: QueryResult?
-    private(set) var isExecuting = false
     private(set) var isApplyingChange = false
-    /// Redacted message shown in the inline error banner.
+    /// Redacted message shown in the inline error banner. Connection-level:
+    /// a background tab's failure still surfaces here.
     var errorMessage: String?
     var showingNewConnection = false
 
@@ -107,12 +85,70 @@ final class SessionStore {
     /// Snapshot of the library, newest first; refreshed after every mutation.
     private(set) var queryEntries: [QueryEntry] = []
 
-    private var executionTask: Task<Void, Never>?
-    private var activeRequestID: UUID?
-    /// Set when the user cancelled the in-flight request; adapter-specific
-    /// cancellation errors are then silenced even when they are not
-    /// `CancellationError` (each engine has its own cancelled type).
-    private var cancellationRequested = false
+    // MARK: Tabs (ROADMAP M3 多结果标签页)
+
+    /// The workspace's result tabs. Always non-empty (a lone empty draft tab
+    /// is the zero state); they belong to the selected connection and are
+    /// discarded on connection switch/removal. No hard count limit: every
+    /// tab's result is already row- and byte-capped by the adapters.
+    private(set) var tabs: [QueryTab] = [QueryTab()]
+    private(set) var selectedTabID: UUID?
+
+    /// The tab the workspace currently shows. Every per-tab property below
+    /// forwards to it, keeping the pre-tabs API shape for views and tests.
+    var activeTab: QueryTab {
+        tabs.first { $0.id == selectedTabID } ?? tabs[0]
+    }
+
+    /// Per-tab forwards: editor text and Mongo mode.
+    var queryText: String {
+        get { activeTab.queryText }
+        set { activeTab.queryText = newValue }
+    }
+    var mongoQueryMode: MongoQueryMode {
+        get { activeTab.mongoQueryMode }
+        set { activeTab.mongoQueryMode = newValue }
+    }
+    /// Per-tab forwards: the visible result and execution flag.
+    private(set) var result: QueryResult? {
+        get { activeTab.result }
+        set { activeTab.result = newValue }
+    }
+    private(set) var isExecuting: Bool {
+        get { activeTab.isExecuting }
+        set { activeTab.isExecuting = newValue }
+    }
+    /// Per-tab forwards: preview browsing state (the previewed object, paging,
+    /// sort/filter, FK-jump equalities, and the previewed object's FKs).
+    private(set) var previewedObject: DatabaseObject? {
+        get { activeTab.previewedObject }
+        set { activeTab.previewedObject = newValue }
+    }
+    private(set) var previewOffset: Int {
+        get { activeTab.previewOffset }
+        set { activeTab.previewOffset = newValue }
+    }
+    private(set) var previewSort: PreviewRequest.Sort? {
+        get { activeTab.previewSort }
+        set { activeTab.previewSort = newValue }
+    }
+    private(set) var previewFilter: PreviewRequest.Filter? {
+        get { activeTab.previewFilter }
+        set { activeTab.previewFilter = newValue }
+    }
+    private(set) var previewEqualities: [PreviewRequest.Equality] {
+        get { activeTab.previewEqualities }
+        set { activeTab.previewEqualities = newValue }
+    }
+    private(set) var previewedForeignKeys: [ForeignKey] {
+        get { activeTab.previewedForeignKeys }
+        set { activeTab.previewedForeignKeys = newValue }
+    }
+    /// Per-tab forward: the staged batch (ROADMAP M3 批量编辑暂存).
+    private(set) var pendingChanges: [PendingChange] {
+        get { activeTab.pendingChanges }
+        set { activeTab.pendingChanges = newValue }
+    }
 
     var selectedSession: Session? { sessions.first { $0.id == selectedConnectionID } }
 
@@ -126,6 +162,7 @@ final class SessionStore {
         self.connectionStore = connectionStore
         self.queryLibrary = queryLibrary
         queryEntries = queryLibrary?.entries ?? []
+        selectedTabID = tabs[0].id
         sessions = DemoAdapter.demoSessions().map { Session(profile: $0.profile, adapter: $0) }
         if let first = sessions.first { selectConnection(first.id) }
         restorePersistedConnections()
@@ -147,6 +184,41 @@ final class SessionStore {
         return build(nil) ?? []
     }
 
+    // MARK: Tab management
+
+    /// Opens a fresh tab (seeded with the default query when the object list
+    /// is known) and selects it.
+    func newTab() {
+        let tab = QueryTab(queryText: seedQueryText())
+        tabs.append(tab)
+        selectedTabID = tab.id
+    }
+
+    func selectTab(_ id: UUID) {
+        guard selectedTabID != id, tabs.contains(where: { $0.id == id }) else { return }
+        selectedTabID = id
+    }
+
+    /// Closes one tab, cancelling its in-flight query. Closing the last tab
+    /// leaves a fresh draft tab — the workspace always has exactly one.
+    func closeTab(_ id: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+        cancelInFlight(tabs[index])
+        tabs.remove(at: index)
+        if tabs.isEmpty {
+            let fresh = QueryTab(queryText: seedQueryText())
+            tabs = [fresh]
+            selectedTabID = fresh.id
+        } else if selectedTabID == id || selectedTabID == nil {
+            selectedTabID = tabs[min(index, tabs.count - 1)].id
+        }
+    }
+
+    private func seedQueryText() -> String {
+        guard let engine = selectedSession?.profile.engine else { return "" }
+        return Self.defaultQuery(for: engine, objects: objects)
+    }
+
     // MARK: Connections
 
     func selectConnection(_ id: UUID?) {
@@ -159,24 +231,18 @@ final class SessionStore {
 
     /// Clears everything tied to the previously selected connection.
     private func resetSelectionState() {
-        // Staged batch edits are scoped to one connection's preview; a
-        // connection switch discards them with a visible notice.
-        let stagedCount = pendingChanges.count
-        pendingChanges = []
+        // Staged batch edits are scoped to one connection's previews; a
+        // connection switch discards every tab's batch with a notice.
+        let stagedCount = tabs.reduce(0) { $0 + $1.pendingChanges.count }
         objects = []
         selectedObject = nil
-        previewedObject = nil
-        previewOffset = 0
-        previewSort = nil
-        previewFilter = nil
-        previewEqualities = []
-        previewedForeignKeys = []
         result = nil
         errorMessage = stagedCount > 0
             ? "Discarded \(stagedCount) staged \(stagedCount == 1 ? "change" : "changes") — the connection changed."
             : nil
-        queryText = ""
-        mongoQueryMode = .find
+        // Fresh workspace: one empty draft tab; loadObjects seeds its text.
+        tabs = [QueryTab()]
+        selectedTabID = tabs[0].id
         createStatement = nil
         tableStatistics = nil
         serverActivity = nil
@@ -496,16 +562,21 @@ final class SessionStore {
         loadPreview(object)
     }
 
-    /// The request for the current browsing state; the request id is the one
-    /// registered with `activeRequestID`, so Cancel interrupts page loads too.
-    private func currentPreviewRequest(for object: DatabaseObject, requestID: UUID = UUID()) -> PreviewRequest {
+    /// The request for the tab's current browsing state; the request id is
+    /// the one registered with the tab's `activeRequestID`, so Cancel
+    /// interrupts page loads too.
+    private func currentPreviewRequest(
+        on tab: QueryTab,
+        for object: DatabaseObject,
+        requestID: UUID = UUID()
+    ) -> PreviewRequest {
         PreviewRequest(
             object: object,
-            offset: previewOffset,
+            offset: tab.previewOffset,
             limit: Self.previewPageSize,
-            sort: previewSort,
-            filter: previewFilter,
-            equalities: previewEqualities,
+            sort: tab.previewSort,
+            filter: tab.previewFilter,
+            equalities: tab.previewEqualities,
             requestID: requestID)
     }
 
@@ -573,49 +644,53 @@ final class SessionStore {
         }
     }
 
-    /// Loads the preview of `object` with the current page/sort/filter state.
-    /// Previews register a request ID just like queries, so Cancel works.
+    /// Loads the preview of `object` into the active tab with its current
+    /// page/sort/filter state. Previews register a request ID just like
+    /// queries, so Cancel works. The task captures its tab: a background tab's
+    /// completion lands on its own tab and never clobbers the visible one.
     private func loadPreview(_ object: DatabaseObject) {
-        guard let session = selectedSession, !isExecuting else { return }
+        guard let session = selectedSession else { return }
+        let tab = activeTab
+        guard !tab.isExecuting else { return }
         let connectionID = session.id
         selectedObject = object
-        previewedObject = object
+        tab.previewedObject = object
         errorMessage = nil
-        isExecuting = true
+        tab.isExecuting = true
         let requestID = UUID()
-        activeRequestID = requestID
-        let request = currentPreviewRequest(for: object, requestID: requestID)
+        tab.activeRequestID = requestID
+        let request = currentPreviewRequest(on: tab, for: object, requestID: requestID)
         let adapter = session.adapter
-        executionTask = Task { @MainActor in
-            defer { finishExecution(for: requestID) }
+        tab.executionTask = Task { @MainActor in
+            defer { finishExecution(on: tab, for: requestID) }
             do {
                 let previewed = try await adapter.previewObject(request)
                 // Ignore stale completions after the user switched connections
-                // or a newer page load superseded this one.
-                guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
-                result = previewed
+                // or a newer page load superseded this one on this tab.
+                guard selectedConnectionID == connectionID, tab.activeRequestID == requestID else { return }
+                tab.result = previewed
                 // FK metadata backs the row context menu's "Jump to
                 // Referenced Row"; a metadata failure degrades to no menu
                 // entries, never a banner — the preview itself succeeded.
                 if let foreignKeyAdapter = adapter as? any SupportsForeignKeys {
                     let keys = (try? await foreignKeyAdapter.foreignKeys(for: object)) ?? []
-                    guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
-                    previewedForeignKeys = keys
+                    guard selectedConnectionID == connectionID, tab.activeRequestID == requestID else { return }
+                    tab.previewedForeignKeys = keys
                 } else {
-                    previewedForeignKeys = []
+                    tab.previewedForeignKeys = []
                 }
             } catch {
-                guard activeRequestID == requestID else { return }
+                guard tab.activeRequestID == requestID else { return }
                 // The screen still shows the previous data; never leave the
                 // preview pointer aimed at the object that never loaded.
-                previewedObject = nil
-                previewOffset = 0
-                previewEqualities = []
-                previewedForeignKeys = []
+                tab.previewedObject = nil
+                tab.previewOffset = 0
+                tab.previewEqualities = []
+                tab.previewedForeignKeys = []
                 // Cancelled: keep the previous result, no banner.
-                guard !cancellationRequested, !Self.isCancellation(error) else { return }
+                guard !tab.cancellationRequested, !Self.isCancellation(error) else { return }
                 guard selectedConnectionID == connectionID else { return }
-                result = nil
+                tab.result = nil
                 errorMessage = Self.redactedMessage(for: error)
             }
         }
@@ -649,33 +724,36 @@ final class SessionStore {
     }
 
     /// Shared execution core for ad-hoc queries and EXPLAIN runs (ROADMAP M2
-    /// ⑧): registers the request ID (Cancel and the staleness guards work),
-    /// surfaces redacted errors, and records history only for user queries
-    /// (`record`) — explains are meta-queries and stay out of the history.
+    /// ⑧): registers the request ID on the active tab (Cancel and the
+    /// staleness guards work per tab), surfaces redacted errors, and records
+    /// history only for user queries (`record`) — explains are meta-queries
+    /// and stay out of the history.
     private func executeCommand(
         session: Session,
         record historyCommand: DatabaseCommand?,
         operation: @escaping @Sendable (any DatabaseAdapter, ExecuteOptions) async throws -> QueryResult
     ) {
+        let tab = activeTab
         errorMessage = nil
-        isExecuting = true
+        tab.isExecuting = true
         let connectionID = session.id
         let adapter = session.adapter
         let options = ExecuteOptions()
         let requestID = options.requestID
-        activeRequestID = requestID
-        executionTask = Task { @MainActor in
-            defer { finishExecution(for: requestID) }
+        tab.activeRequestID = requestID
+        tab.executionTask = Task { @MainActor in
+            defer { finishExecution(on: tab, for: requestID) }
             do {
                 let executed = try await operation(adapter, options)
-                // Ignore stale completions after the user switched connections.
-                guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
-                result = executed
+                // Ignore stale completions after the user switched connections
+                // or the tab started a newer execution.
+                guard selectedConnectionID == connectionID, tab.activeRequestID == requestID else { return }
+                tab.result = executed
                 if let historyCommand { recordQuery(historyCommand, session: session) }
             } catch {
                 // Cancelled: keep the previous result, no banner.
-                guard !cancellationRequested, !Self.isCancellation(error) else { return }
-                guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
+                guard !tab.cancellationRequested, !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID, tab.activeRequestID == requestID else { return }
                 errorMessage = Self.redactedMessage(for: error)
             }
         }
@@ -741,36 +819,45 @@ final class SessionStore {
     }
 
 
+    /// Cancels the active tab's in-flight query/preview. Other tabs keep
+    /// running — cancellation is per tab.
     func cancelQuery() {
-        guard let requestID = activeRequestID, let session = selectedSession else { return }
-        cancellationRequested = true
-        executionTask?.cancel()
+        let tab = activeTab
+        guard let requestID = tab.activeRequestID, let session = selectedSession else { return }
+        tab.cancellationRequested = true
+        tab.executionTask?.cancel()
         Task { try? await session.adapter.cancel(requestID: requestID) }
     }
 
-    /// Cancels any in-flight query/preview and resets execution state; used
-    /// when the selected connection changes or goes away.
+    /// Cancels every tab's in-flight query/preview; used when the selected
+    /// connection changes or goes away.
     private func cancelInFlight() {
-        guard isExecuting else { return }
-        let requestID = activeRequestID
+        for tab in tabs { cancelInFlight(tab) }
+    }
+
+    /// Cancels one tab's in-flight request and resets its execution state.
+    private func cancelInFlight(_ tab: QueryTab) {
+        guard tab.isExecuting else { return }
+        let requestID = tab.activeRequestID
         let session = selectedSession
-        executionTask?.cancel()
-        executionTask = nil
-        isExecuting = false
-        activeRequestID = nil
-        cancellationRequested = false
+        tab.executionTask?.cancel()
+        tab.executionTask = nil
+        tab.isExecuting = false
+        tab.activeRequestID = nil
+        tab.cancellationRequested = false
         if let requestID, let session {
             Task { try? await session.adapter.cancel(requestID: requestID) }
         }
     }
 
-    /// Resets execution state, but only when this request is still the
-    /// current one — a stale task must not clobber a newer execution.
-    private func finishExecution(for requestID: UUID) {
-        guard activeRequestID == requestID else { return }
-        isExecuting = false
-        activeRequestID = nil
-        cancellationRequested = false
+    /// Resets a tab's execution state, but only when this request is still
+    /// the tab's current one — a stale task must not clobber a newer
+    /// execution (on this or any other tab).
+    private func finishExecution(on tab: QueryTab, for requestID: UUID) {
+        guard tab.activeRequestID == requestID else { return }
+        tab.isExecuting = false
+        tab.activeRequestID = nil
+        tab.cancellationRequested = false
     }
 
     // MARK: Record editing
@@ -803,6 +890,10 @@ final class SessionStore {
             return false
         }
         let connectionID = session.id
+        // The edit belongs to the tab whose preview the reviewer saw; capture
+        // it so a tab switch mid-apply re-previews the right tab.
+        let tab = activeTab
+        let rePreview = tab.previewedObject.map { currentPreviewRequest(on: tab, for: $0) }
         errorMessage = nil
         isApplyingChange = true
         defer { isApplyingChange = false }
@@ -810,8 +901,8 @@ final class SessionStore {
             _ = try await adapter.applyDataChange(change)
             // Re-preview at the same page/sort/filter so the reviewer sees the
             // change where they made it.
-            if let object = previewedObject, selectedConnectionID == connectionID {
-                result = try await adapter.previewObject(currentPreviewRequest(for: object))
+            if let rePreview, selectedConnectionID == connectionID {
+                tab.result = try await adapter.previewObject(rePreview)
             }
             return true
         } catch {
@@ -956,12 +1047,13 @@ final class SessionStore {
     // MARK: - Batch staging (ROADMAP M3 批量编辑暂存)
 
     /// The staged batch: changes the user reviewed but has not applied yet.
-    /// Scoped to the current `previewedObject` — cross-table batches are not
-    /// supported. Lifecycle: discarded (with a notice) on connection switch
-    /// and on previewing a different object; kept across refreshes and ad-hoc
-    /// queries (each entry carries its own optimistic-lock baseline, so
-    /// shifted data surfaces as a per-item conflict at apply time).
-    private(set) var pendingChanges: [PendingChange] = []
+    /// Per tab (`pendingChanges` forwards to the active tab), scoped to that
+    /// tab's `previewedObject` — cross-table batches are not supported.
+    /// Lifecycle: discarded (with a notice) on connection switch and on
+    /// previewing a different object; kept across tab switches (each tab
+    /// keeps its own batch), refreshes, and ad-hoc queries (each entry
+    /// carries its own optimistic-lock baseline, so shifted data surfaces as
+    /// a per-item conflict at apply time).
 
     /// Whether reviewed changes may be staged: the same fail-closed gate as
     /// record editing (writable, real preview of one table/collection whose
@@ -1024,15 +1116,18 @@ final class SessionStore {
             return false
         }
         let connectionID = session.id
+        // The batch belongs to the tab that staged it; capture the tab so a
+        // tab switch mid-apply trims and re-previews the right tab.
+        let tab = activeTab
         errorMessage = nil
         isApplyingChange = true
         defer { isApplyingChange = false }
 
-        let total = pendingChanges.count
+        let total = tab.pendingChanges.count
         var applied = 0
         var failure: String?
         var cancelled = false
-        for pending in pendingChanges {
+        for pending in tab.pendingChanges {
             do {
                 _ = try await adapter.applyDataChange(pending.review.dataChange)
                 applied += 1
@@ -1048,7 +1143,7 @@ final class SessionStore {
         // Ignore stale completions after the user switched connections; the
         // switch already discarded the batch.
         guard selectedConnectionID == connectionID else { return false }
-        pendingChanges.removeFirst(min(applied, pendingChanges.count))
+        tab.pendingChanges.removeFirst(min(applied, tab.pendingChanges.count))
         if cancelled { return false }
         if let failure {
             errorMessage = applied > 0
@@ -1056,8 +1151,8 @@ final class SessionStore {
                 : failure
         }
         // One re-preview at the end so the grid reflects what landed.
-        if let object = previewedObject {
-            result = try? await adapter.previewObject(currentPreviewRequest(for: object))
+        if let object = tab.previewedObject {
+            tab.result = try? await adapter.previewObject(currentPreviewRequest(on: tab, for: object))
         }
         return failure == nil
     }
@@ -1170,6 +1265,7 @@ final class SessionStore {
         let flag = importCancelFlag
         flag.reset()
         let progressRelay = ImportProgressRelay()
+        let tab = activeTab
         importTask = Task { @MainActor in
             defer {
                 isImporting = false
@@ -1189,9 +1285,11 @@ final class SessionStore {
                         }
                     }))
                 importSummary = summary
-                // Refresh the preview (same page) so the imported rows are visible.
-                if let object = previewedObject, selectedConnectionID == session.id {
-                    result = try? await adapter.previewObject(currentPreviewRequest(for: object))
+                // Refresh the preview (same page) so the imported rows are
+                // visible — on the tab that started the import.
+                if let object = tab.previewedObject, selectedConnectionID == session.id {
+                    tab.result = try? await adapter.previewObject(
+                        currentPreviewRequest(on: tab, for: object))
                 }
             } catch {
                 importSummary = nil
