@@ -759,6 +759,26 @@ final class SessionStore {
         }
     }
 
+    // MARK: Query formatting (ROADMAP M3 查询格式化)
+
+    /// SQL-only: MongoDB editor text is Extended JSON, not SQL — the Format
+    /// affordance fails closed there.
+    var canFormatQuery: Bool {
+        guard let session = selectedSession,
+              session.profile.engine.isSQLFamily,
+              !queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        return true
+    }
+
+    /// Formats the active tab's editor text in place. Conservative by
+    /// construction (`SQLFormatter` never alters a token and self-verifies):
+    /// anything unrecognized comes back unchanged.
+    func formatCurrentQuery() {
+        guard canFormatQuery else { return }
+        queryText = SQLFormatter.format(queryText)
+    }
+
     // MARK: Explain (ROADMAP M2 ⑧)
 
     /// The Explain affordance: there is query text and, for MongoDB, a

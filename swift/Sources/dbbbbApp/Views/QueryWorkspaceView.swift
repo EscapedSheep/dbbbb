@@ -66,6 +66,14 @@ struct QueryWorkspaceView: View {
                     .help("Cancel the running query (⌘.)")
                 } else {
                     Button {
+                        store.formatCurrentQuery()
+                    } label: {
+                        Label("Format", systemImage: "textformat")
+                    }
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
+                    .disabled(!store.canFormatQuery)
+                    .help("Format the SQL query (⇧⌘F)")
+                    Button {
                         store.explainCurrentQuery()
                     } label: {
                         Label("Explain", systemImage: "doc.text.magnifyingglass")
