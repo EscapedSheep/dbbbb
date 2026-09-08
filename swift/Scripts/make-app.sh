@@ -77,7 +77,7 @@ BUNDLE_ID="dev.dbbbb"
 # Fallback version, used only when HEAD carries no exact git tag. When HEAD
 # is tagged, the tag is the single source of truth and must agree with this
 # constant — a mismatch is a hard error (update the constant or fix the tag).
-FALLBACK_VERSION="0.3.0"
+FALLBACK_VERSION="0.4.0"
 MIN_MACOS="15.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
