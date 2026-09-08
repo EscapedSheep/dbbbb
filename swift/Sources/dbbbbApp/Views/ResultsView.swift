@@ -24,6 +24,10 @@ struct ResultsView: View {
                     PreviewFilterBar(result: result)
                     Divider()
                 }
+                if !store.pendingChanges.isEmpty {
+                    PendingChangesBar()
+                    Divider()
+                }
                 switch result {
                 case .rows(let columns, let rows, _):
                     RowsTableView(columns: columns, rows: rows)
@@ -250,7 +254,9 @@ struct RowsTableView: View {
                 }
             }
             .sheet(item: $editingState) { _ in
-                RecordEditingSheet(state: $editingState)
+                RecordEditingSheet(
+                    state: $editingState,
+                    onStage: { review in store.stage(review) })
             }
             .sheet(item: $valueEdit, onDismiss: presentPendingValueReview) { target in
                 ValueEditorSheet(

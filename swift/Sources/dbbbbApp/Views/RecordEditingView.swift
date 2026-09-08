@@ -81,9 +81,12 @@ struct FieldEditTarget: Identifiable {
 }
 
 /// The editing sheet: draft phase and review phase in one container so the
-/// edit → review transition does not re-present.
+/// edit → review transition does not re-present. `onStage`, when provided,
+/// adds a Stage button to the review phase: the reviewed change joins the
+/// batch-editing buffer (ROADMAP M3 批量编辑暂存) instead of applying now.
 struct RecordEditingSheet: View {
     @Binding var state: RecordEditingState?
+    var onStage: ((RecordReview) -> Void)?
 
     var body: some View {
         switch state {
@@ -96,7 +99,8 @@ struct RecordEditingSheet: View {
             RecordReviewView(
                 review: review,
                 onBack: review.isDelete ? nil : { state = .editing(review.draft) },
-                onDone: { state = nil })
+                onDone: { state = nil },
+                onStage: onStage)
         case .none:
             Text("Nothing to review.")
                 .padding()
@@ -476,6 +480,9 @@ private struct RecordReviewView: View {
     let review: RecordReview
     let onBack: (() -> Void)?
     let onDone: () -> Void
+    /// When non-nil, a Stage button adds the review to the batch-editing
+    /// buffer instead of applying it now (ROADMAP M3 批量编辑暂存).
+    var onStage: ((RecordReview) -> Void)?
 
     @State private var confirmation = ""
     @State private var applying = false
@@ -571,6 +578,13 @@ private struct RecordReviewView: View {
                     Button("Back", action: onBack)
                 }
                 Spacer()
+                if let onStage {
+                    Button("Stage") {
+                        onStage(review)
+                        onDone()
+                    }
+                    .help("Add to the staged batch instead of applying now")
+                }
                 Button(applyTitle, action: apply)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!canApply)

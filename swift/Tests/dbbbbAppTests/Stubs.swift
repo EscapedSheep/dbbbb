@@ -95,6 +95,10 @@ final class IntrospectingStubAdapter: StubAdapter, SupportsIntrospection, @unche
 final class EditingStubAdapter: StubAdapter, SupportsEditing, @unchecked Sendable {
     var applyDelay: Duration = .zero
     var applyError: (any Error)?
+    /// When non-empty, each apply consumes the next entry instead of the
+    /// blanket `applyError`: nil = success, an error = throw. Drives the
+    /// batch stop-at-first-failure tests.
+    var applyErrorSequence: [(any Error)?] = []
     var insertableColumnResult: [InsertableColumn] = [
         InsertableColumn(name: "id", primaryKeyOrdinal: 1),
         InsertableColumn(name: "name", primaryKeyOrdinal: 0),
@@ -105,6 +109,17 @@ final class EditingStubAdapter: StubAdapter, SupportsEditing, @unchecked Sendabl
     var applied: [DataChange] { lock.withLock { appliedChanges } }
 
     func applyDataChange(_ change: DataChange) async throws -> QueryResult {
+        // A queued sequence entry (success or failure) takes precedence over
+        // the blanket error: outer nil = no sequence left, .some(nil) =
+        // success, .some(error) = throw.
+        let entry: (any Error)?? = lock.withLock {
+            applyErrorSequence.isEmpty ? nil : .some(applyErrorSequence.removeFirst())
+        }
+        if let entry {
+            if let error = entry { throw error }
+            lock.withLock { appliedChanges.append(change) }
+            return Self.rowsResult
+        }
         lock.withLock { appliedChanges.append(change) }
         if applyDelay > .zero { try await Task.sleep(for: applyDelay) }
         try Task.checkCancellation()

@@ -159,6 +159,10 @@ final class SessionStore {
 
     /// Clears everything tied to the previously selected connection.
     private func resetSelectionState() {
+        // Staged batch edits are scoped to one connection's preview; a
+        // connection switch discards them with a visible notice.
+        let stagedCount = pendingChanges.count
+        pendingChanges = []
         objects = []
         selectedObject = nil
         previewedObject = nil
@@ -168,7 +172,9 @@ final class SessionStore {
         previewEqualities = []
         previewedForeignKeys = []
         result = nil
-        errorMessage = nil
+        errorMessage = stagedCount > 0
+            ? "Discarded \(stagedCount) staged \(stagedCount == 1 ? "change" : "changes") — the connection changed."
+            : nil
         queryText = ""
         mongoQueryMode = .find
         createStatement = nil
@@ -181,7 +187,9 @@ final class SessionStore {
 
     /// Refresh zeroes the browsing state (new data may shift page contents)
     /// and reloads the visible preview from page one; the object list reload
-    /// runs independently.
+    /// runs independently. Staged batch edits survive a refresh: each staged
+    /// change carries its own optimistic-lock baseline, so data that shifted
+    /// underneath surfaces as a per-item conflict at apply time instead.
     func refreshObjects() {
         previewOffset = 0
         previewSort = nil
@@ -443,6 +451,10 @@ final class SessionStore {
 
     func preview(_ object: DatabaseObject) {
         guard selectedSession != nil, !isExecuting else { return }
+        // Staged batch edits are scoped to one object; previewing a different
+        // object discards them with a visible notice (set after loadPreview,
+        // which clears the banner at its start).
+        let discarding = previewedObject != nil && previewedObject?.id != object.id
         // Switching objects zeroes the browsing state.
         previewOffset = 0
         previewSort = nil
@@ -450,6 +462,9 @@ final class SessionStore {
         previewEqualities = []
         previewedForeignKeys = []
         loadPreview(object)
+        if discarding {
+            discardPendingChanges(reason: "the previewed object changed")
+        }
     }
 
     func nextPreviewPage() {
@@ -543,12 +558,19 @@ final class SessionStore {
                   || foreignKey.referencedObject.kind == .view,
               let equalities = Self.equalityFilters(for: foreignKey, row: row)
         else { return }
+        // The jump lands on a different object; staged batch edits of the
+        // previous one are discarded with a visible notice (set after
+        // loadPreview, which clears the banner at its start).
+        let discarding = previewedObject?.id != foreignKey.referencedObject.id
         previewOffset = 0
         previewSort = nil
         previewFilter = nil
         previewEqualities = equalities
         previewedForeignKeys = []
         loadPreview(foreignKey.referencedObject)
+        if discarding {
+            discardPendingChanges(reason: "the previewed object changed")
+        }
     }
 
     /// Loads the preview of `object` with the current page/sort/filter state.
@@ -929,6 +951,115 @@ final class SessionStore {
             changes: [(column, before, newValue)],
             changed: [column: newValue],
             isDelete: false)
+    }
+
+    // MARK: - Batch staging (ROADMAP M3 批量编辑暂存)
+
+    /// The staged batch: changes the user reviewed but has not applied yet.
+    /// Scoped to the current `previewedObject` — cross-table batches are not
+    /// supported. Lifecycle: discarded (with a notice) on connection switch
+    /// and on previewing a different object; kept across refreshes and ad-hoc
+    /// queries (each entry carries its own optimistic-lock baseline, so
+    /// shifted data surfaces as a per-item conflict at apply time).
+    private(set) var pendingChanges: [PendingChange] = []
+
+    /// Whether reviewed changes may be staged: the same fail-closed gate as
+    /// record editing (writable, real preview of one table/collection whose
+    /// adapter opted into `SupportsEditing`).
+    var canStageChanges: Bool { editingObject != nil }
+
+    /// Adds one reviewed change to the batch. Staging is not a write, so it
+    /// needs no production confirmation; the batch apply confirms instead.
+    /// Fails closed silently: a review for anything but the currently
+    /// editable preview is refused.
+    func stage(_ review: RecordReview) {
+        guard let object = editingObject, review.draft.object == object else { return }
+        pendingChanges.append(PendingChange(review: review))
+    }
+
+    func removePendingChange(id: UUID) {
+        pendingChanges.removeAll { $0.id == id }
+    }
+
+    func clearPendingChanges() {
+        pendingChanges = []
+    }
+
+    /// Empties the batch with a banner notice; silent when already empty.
+    private func discardPendingChanges(reason: String) {
+        guard !pendingChanges.isEmpty else { return }
+        let count = pendingChanges.count
+        pendingChanges = []
+        errorMessage = "Discarded \(count) staged \(count == 1 ? "change" : "changes") — \(reason)."
+    }
+
+    var canApplyPendingChanges: Bool {
+        guard let session = selectedSession,
+              !session.profile.readOnly,
+              !session.profile.demo,
+              !isApplyingChange,
+              !pendingChanges.isEmpty,
+              session.adapter is any SupportsEditing
+        else { return false }
+        return true
+    }
+
+    /// Applies the batch in order through the exact per-change pipeline
+    /// (`adapter.applyDataChange` — planner, optimistic lock, adapter-side
+    /// guards), then re-previews once. Failure policy: stop at the first
+    /// failure — applied entries are written and leave the batch, the failed
+    /// one and everything after it stays staged for fixing/retry, and the
+    /// banner reports the honest partial count. Deliberately no fake
+    /// transaction wrapping. Returns true only when every entry applied.
+    @discardableResult
+    func applyPendingChanges() async -> Bool {
+        guard let session = selectedSession,
+              !session.profile.readOnly,
+              !session.profile.demo,
+              !isApplyingChange,
+              !pendingChanges.isEmpty,
+              let adapter = session.adapter as? any SupportsEditing
+        else {
+            errorMessage = "This connection does not support editing records."
+            return false
+        }
+        let connectionID = session.id
+        errorMessage = nil
+        isApplyingChange = true
+        defer { isApplyingChange = false }
+
+        let total = pendingChanges.count
+        var applied = 0
+        var failure: String?
+        var cancelled = false
+        for pending in pendingChanges {
+            do {
+                _ = try await adapter.applyDataChange(pending.review.dataChange)
+                applied += 1
+            } catch {
+                if Self.isCancellation(error) {
+                    cancelled = true
+                } else {
+                    failure = Self.redactedMessage(for: error)
+                }
+                break
+            }
+        }
+        // Ignore stale completions after the user switched connections; the
+        // switch already discarded the batch.
+        guard selectedConnectionID == connectionID else { return false }
+        pendingChanges.removeFirst(min(applied, pendingChanges.count))
+        if cancelled { return false }
+        if let failure {
+            errorMessage = applied > 0
+                ? "Applied \(applied) of \(total) staged changes, then stopped: \(failure)"
+                : failure
+        }
+        // One re-preview at the end so the grid reflects what landed.
+        if let object = previewedObject {
+            result = try? await adapter.previewObject(currentPreviewRequest(for: object))
+        }
+        return failure == nil
     }
 
     // MARK: - Result export

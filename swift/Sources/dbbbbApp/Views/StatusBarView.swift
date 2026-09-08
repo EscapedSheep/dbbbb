@@ -102,7 +102,9 @@ struct StatusBarView: View {
         .padding(.vertical, 6)
         .background(.bar)
         .sheet(item: recordEditingState) { _ in
-            RecordEditingSheet(state: recordEditingState)
+            RecordEditingSheet(
+                state: recordEditingState,
+                onStage: { review in store.stage(review) })
         }
     }
 
