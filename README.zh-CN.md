@@ -12,7 +12,9 @@ dbbbb 是一个本地优先的开源 macOS 数据库客户端，支持 PostgreSQ
 ## 目前已实现的功能
 
 - 四个引擎的真实连接：PostgreSQL、MySQL 支持 `disable`、`require`、`verify-full` SSL 模式；MongoDB 支持 SRV URI 并强制 TLS；SQLite 打开本地数据库文件，可选只读。
-- 对象浏览、生成预览与查询执行：结果有界（每结果 500 行 / 5 MiB，单值 8 MiB 并附显式截断标记）、可定向取消、错误信息脱敏（绝不泄露密码、URI 或本地路径）。
+- 对象浏览、生成预览与查询执行：结果有界（每结果 500 行 / 5 MiB，单值 8 MiB 并附显式截断标记）、可定向取消、错误信息脱敏（绝不泄露密码、URI 或本地路径）。双击表或视图立即运行其 `SELECT … LIMIT 100`（MongoDB 集合则运行 find）。
+- 表与视图的 View Create Statement（PostgreSQL / MySQL / SQLite）：DDL 以只读弹窗展示，等宽字体、可复制（fail-closed 能力——MongoDB 与不支持的适配器不会显示入口）。
+- 数据库字段可选：PostgreSQL 空值回退到 `postgres` 维护库；MySQL 空值不设默认 schema，按服务器范围浏览所有非系统 schema。
 - 只读连接双重强制：客户端语句分类器 + 服务端只读设置。
 - 四引擎均可审查的单条记录更新/删除：草稿 → 复核两段式流程、乐观冲突检测、production 环境须输入文字二次确认。编辑是 fail-closed 能力——只读配置、非预览结果或不支持的适配器根本不会显示编辑入口。
 - 导入导出：CSV 导入 SQL 表、JSONL 导入 MongoDB 集合（分批、有界、可取消）；当前有界结果可导出为 CSV 或 canonical JSONL，原子写盘。

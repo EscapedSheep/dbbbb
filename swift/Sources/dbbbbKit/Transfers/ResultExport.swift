@@ -109,7 +109,9 @@ public struct ExportedResult: Sendable, Equatable {
 /// bounds. Row results become CSV (header + CRLF records); document results
 /// become canonical Extended JSONL (one compact EJSON document per
 /// LF-terminated line, keys in their original BSON order) so a MongoDB
-/// export re-imports with BSON types intact.
+/// export re-imports with BSON types intact. On request (`Format.insertStatements`)
+/// row results of a known target table instead become a `.sql` file of
+/// `INSERT` statements, rendered by `InsertStatementRenderer`.
 ///
 /// CSV formula-injection neutralization: string cells and header names that
 /// start with `=`, `+`, `-`, or `@` are prefixed with a single quote `'` —
@@ -118,12 +120,36 @@ public struct ExportedResult: Sendable, Equatable {
 /// quote becomes part of the exported text, so re-importing such a CSV
 /// carries the leading `'` into the stored value.
 public enum ResultExporter {
-    public static func exportData(for result: QueryResult) throws -> ExportedResult {
-        switch result {
-        case .rows(let columns, let rows, _):
-            return try csvExport(columns: columns, rows: rows)
-        case .documents(let documents, _):
-            return try jsonLinesExport(documents: documents)
+    /// Which serialization `exportData(for:format:)` produces.
+    public enum Format: Sendable, Equatable {
+        /// The automatic mapping: CSV for row results, JSONL for documents.
+        case automatic
+        /// SQL INSERT statements (`.sql`) for row results. Requires the
+        /// qualified target table path; only previews know one. Rendering
+        /// reuses `InsertStatementRenderer` (lowest-common-denominator
+        /// dialect; see its doc comment). Document results fail closed —
+        /// MongoDB exports stay JSONL-only.
+        case insertStatements(table: [String])
+    }
+
+    public static func exportData(
+        for result: QueryResult, format: Format = .automatic
+    ) throws -> ExportedResult {
+        switch format {
+        case .automatic:
+            switch result {
+            case .rows(let columns, let rows, _):
+                return try csvExport(columns: columns, rows: rows)
+            case .documents(let documents, _):
+                return try jsonLinesExport(documents: documents)
+            }
+        case .insertStatements(let table):
+            guard case .rows(let columns, let rows, _) = result else {
+                throw ResultExportError.invalidShape
+            }
+            let text = try InsertStatementRenderer.render(table: table, columns: columns, rows: rows)
+            return ExportedResult(
+                data: Data((text + "\n").utf8), fileExtension: "sql", rows: rows.count)
         }
     }
 
@@ -183,5 +209,101 @@ public enum ResultExporter {
             text += try EJSONSerializer.serialize(displayValue: document) + "\n"
         }
         return ExportedResult(data: Data(text.utf8), fileExtension: "jsonl", rows: documents.count)
+    }
+}
+
+/// Renders the *displayed* rows — already capped by the execution bounds, so
+/// truncated values cross verbatim with their `…[dbbbb truncated N bytes]`
+/// marker, exactly like the CSV/JSONL exports — as SQL INSERT statements for
+/// the clipboard ("Copy as INSERT").
+///
+/// Dialect trade-off: the export layer has no engine context, so this emits
+/// lowest-common-denominator SQL rather than any engine's exact dialect:
+/// double-quoted identifiers (standard SQL; accepted by PostgreSQL and
+/// SQLite, and by MySQL only under `ANSI_QUOTES`), string literals with
+/// single-quote doubling (backslashes pass through unescaped — under MySQL's
+/// default sql_mode a backslash may instead be read as an escape
+/// introducer), `NULL`, numbers as their exact finite text, booleans as
+/// `TRUE`/`FALSE`. Values with no portable SQL literal fail closed, matching
+/// the existing export discipline: `.binary` and non-finite numbers throw
+/// `ResultExportError.unsupportedValue`; nested arrays/objects cross as a
+/// canonical-JSON string literal (key order sorted, as in CSV cells).
+public enum InsertStatementRenderer {
+    /// One INSERT per row (the maximal common denominator; not every engine
+    /// accepts multi-row VALUES in all contexts), each terminated with `;`,
+    /// statements separated by newlines. `table` is the qualified identifier
+    /// path — every segment is quoted independently.
+    public static func render(table: [String], columns: [ColumnMeta], rows: [[DisplayValue]]) throws -> String {
+        guard !table.isEmpty else { throw ResultExportError.invalidShape }
+        let target = table.map(quoteIdentifier).joined(separator: ".")
+        let columnList = "(" + columns.map { quoteIdentifier($0.name) }.joined(separator: ", ") + ")"
+        var statements: [String] = []
+        for row in rows {
+            guard row.count == columns.count else { throw ResultExportError.invalidShape }
+            let values = try row.map(literal).joined(separator: ", ")
+            statements.append("INSERT INTO \(target) \(columnList) VALUES (\(values));")
+        }
+        return statements.joined(separator: "\n")
+    }
+
+    /// Best-effort qualified table name for "Copy as INSERT", recovered from
+    /// the opaque adapter-issued object id with the same decoders
+    /// `SelectStatementBuilder` uses. Handles that do not decode (demo
+    /// fixtures, ids from other sources) fall back to the bare object name,
+    /// which the renderer quotes as a single identifier.
+    public static func tableNameParts(engine: DatabaseEngine, object: DatabaseObject) -> [String] {
+        switch engine {
+        case .postgresql:
+            if let ref = PostgresObjectIDCodec.decode(object.id), let name = ref.name {
+                return [ref.schema, name]
+            }
+            return [object.name]
+        case .mysql:
+            if let ref = MySQLObjectRef(id: object.id), let name = ref.name {
+                return [ref.database, name]
+            }
+            return [object.name]
+        case .sqlite:
+            // SQLite previews quote the bare name (single-file databases).
+            return [object.name]
+        case .mongodb:
+            // MongoDB results are documents, never rows; the bare name keeps
+            // this switch total without implying INSERT support.
+            return [object.name]
+        }
+    }
+
+    /// Standard-SQL identifier quoting: `"` is doubled.
+    static func quoteIdentifier(_ identifier: String) -> String {
+        "\"" + identifier.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+
+    /// One SQL literal per display value; see the enum doc comment for the
+    /// dialect and fail-closed rules.
+    static func literal(_ value: DisplayValue) throws -> String {
+        switch value {
+        case .null:
+            return "NULL"
+        case .bool(let flag):
+            return flag ? "TRUE" : "FALSE"
+        case .number(let number):
+            guard let text = CanonicalJSON.jsonNumber(number) else {
+                throw ResultExportError.unsupportedValue
+            }
+            return text
+        case .string(let string):
+            return quote(string)
+        case .array, .object:
+            // Nested values have no portable SQL literal; they cross as a
+            // canonical-JSON string (JSON/JSONB columns round-trip this way).
+            return try quote(CanonicalJSON.serialize(value))
+        case .binary:
+            throw ResultExportError.unsupportedValue
+        }
+    }
+
+    /// Standard-SQL string literal: `'` is doubled; nothing else is escaped.
+    static func quote(_ string: String) -> String {
+        "'" + string.replacingOccurrences(of: "'", with: "''") + "'"
     }
 }

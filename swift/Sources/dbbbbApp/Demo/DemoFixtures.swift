@@ -19,6 +19,9 @@ struct DemoFixture: Sendable {
     let objects: [DatabaseObject]
     let tables: [DemoTable]
     let collections: [DemoCollection]
+    /// Canned server-activity rows (ROADMAP M2 ⑨); SQLite is file-local and
+    /// has no server processes, so its demo fixture stays empty.
+    let activities: [ServerActivity]
 
     static func fixture(for engine: DatabaseEngine) -> DemoFixture {
         switch engine {
@@ -102,7 +105,20 @@ struct DemoFixture: Sendable {
                 DemoTable(object: orders, columns: orderColumns, rows: orderRows),
                 DemoTable(object: activeUsers, columns: activeUserColumns, rows: activeUserRows),
             ],
-            collections: []
+            collections: [],
+            activities: [
+                ServerActivity(
+                    id: "8124", user: "etl", database: "warehouse",
+                    statement: "UPDATE orders SET status = 'paid' WHERE created_at < now() - interval '30 days'",
+                    age: .seconds(43), state: "active"),
+                ServerActivity(
+                    id: "8301", user: "reporting", database: "warehouse",
+                    statement: "SELECT user_id, count(*) FROM orders GROUP BY user_id ORDER BY 2 DESC",
+                    age: .seconds(3), state: "active"),
+                ServerActivity(
+                    id: "8310", user: "reporting", database: "warehouse",
+                    statement: nil, age: nil, state: "idle"),
+            ]
         )
     }()
 
@@ -153,6 +169,12 @@ struct DemoFixture: Sendable {
             collections: [
                 DemoCollection(object: events, documents: eventDocs),
                 DemoCollection(object: sessions, documents: sessionDocs),
+            ],
+            activities: [
+                ServerActivity(
+                    id: "22041", user: nil, database: "analytics",
+                    statement: #"{"find":"events","filter":{"type":"purchase"}}"#,
+                    age: .seconds(12), state: "query"),
             ]
         )
     }()
@@ -202,7 +224,16 @@ struct DemoFixture: Sendable {
                 DemoTable(object: products, columns: productColumns, rows: productRows),
                 DemoTable(object: customers, columns: customerColumns, rows: customerRows),
             ],
-            collections: []
+            collections: [],
+            activities: [
+                ServerActivity(
+                    id: "58", user: "nightly", database: "shop",
+                    statement: "UPDATE products SET price = price * 1.05 WHERE in_stock = 1",
+                    age: .seconds(95), state: "Query"),
+                ServerActivity(
+                    id: "61", user: "app", database: "shop",
+                    statement: nil, age: nil, state: "Sleep"),
+            ]
         )
     }()
 
@@ -247,7 +278,9 @@ struct DemoFixture: Sendable {
                 DemoTable(object: notes, columns: noteColumns, rows: noteRows),
                 DemoTable(object: settings, columns: settingColumns, rows: settingRows),
             ],
-            collections: []
+            collections: [],
+            // SQLite is file-local: no server processes to list.
+            activities: []
         )
     }()
 }

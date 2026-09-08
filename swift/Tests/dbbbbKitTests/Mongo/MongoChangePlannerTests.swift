@@ -244,4 +244,47 @@ struct MongoChangePlannerTests {
             try MongoChangePlanner.planDeleteFilter(original: [("name", .string("x"))])
         }
     }
+
+    // MARK: planInsert
+
+    @Test func insertConvertsThroughTheCanonicalEJSONCodec() throws {
+        // The input is a dictionary, so field order is unspecified; compare
+        // key-sorted.
+        let document = try MongoChangePlanner.planInsert([
+            "name": .string("new"),
+            "qty": .number(4),
+            "note": .null,
+            // Tagged shapes keep their BSON type on insert.
+            "_id": .object([("$oid", .string("abababababababababababab"))]),
+            "price": .object([("$numberDecimal", .string("0.1"))]),
+        ]).sorted { $0.key < $1.key }
+        #expect(pairsEqual(document, [
+            ("_id", .objectID(objectID)),
+            ("name", .string("new")),
+            ("note", .null),
+            ("price", try MongoChangePlanner.bsonValue(
+                from: .object([("$numberDecimal", .string("0.1"))]), label: "d")),
+            ("qty", .int32(4)),
+        ]))
+    }
+
+    @Test func insertAllowsAMissingIDAndAnEmptyDocument() throws {
+        // No _id: the server generates an ObjectId.
+        let withoutID = try MongoChangePlanner.planInsert(["name": .string("x")])
+        #expect(pairsEqual(withoutID, [("name", .string("x"))]))
+        // An empty document inserts just the generated _id.
+        #expect(try MongoChangePlanner.planInsert([:]).isEmpty)
+    }
+
+    @Test func insertRejectsUnsafeFieldNames() {
+        assertPlanThrows(containing: "unsafe MongoDB field name") {
+            try MongoChangePlanner.planInsert(["__proto__": .number(1)])
+        }
+        assertPlanThrows(containing: "unsafe MongoDB field name") {
+            try MongoChangePlanner.planInsert(["a.b": .number(1)])
+        }
+        assertPlanThrows(containing: "unsafe MongoDB field name") {
+            try MongoChangePlanner.planInsert(["$set": .number(1)])
+        }
+    }
 }

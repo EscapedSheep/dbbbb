@@ -99,4 +99,17 @@ final class PostgresReadOnlyClassifierTests: XCTestCase {
         assertRejected("")
         assertRejected("   ;  ")
     }
+
+    // MARK: - EXPLAIN viewer regression (ROADMAP M2 ⑧)
+
+    /// The Explain feature relies on the classifier allowing EXPLAIN, while
+    /// EXPLAIN ANALYZE (which executes the statement) must stay rejected.
+    func testExplainAllowedButAnalyzeStaysRejected() {
+        assertAllowed("EXPLAIN SELECT 1")
+        assertAllowed("EXPLAIN (FORMAT JSON) SELECT * FROM users")
+        assertRejected("EXPLAIN ANALYZE SELECT 1", containing: "ANALYZE")
+        // ANALYZE hidden in a comment or literal stays invisible and harmless.
+        assertAllowed("EXPLAIN SELECT 1 -- ANALYZE")
+        assertAllowed("SELECT 'analyze me'")
+    }
 }

@@ -284,4 +284,62 @@ final class MySQLChangePlannerTests: XCTestCase {
             ("b", "int", 3),
         ]))
     }
+
+    // MARK: - planInsert
+
+    func testInsertIsParameterizedInEntryOrder() throws {
+        let plan = try MySQLChangePlanner.planInsert(
+            database: "sales.ops",
+            table: "order`line",
+            entries: [("status", .string("draft")), ("note", .null), ("qty", .number(4))])
+
+        XCTAssertEqual(plan.text, [
+            "INSERT INTO `sales.ops`.`order``line` (`status`, `note`, `qty`)",
+            "VALUES (?, ?, ?)",
+        ].joined(separator: "\n"))
+        XCTAssertEqual(plan.values, [.string("draft"), .null, .number(4)])
+    }
+
+    func testInsertWithNoEntriesUsesAllDefaults() throws {
+        let plan = try MySQLChangePlanner.planInsert(database: "shop", table: "t", entries: [])
+        XCTAssertEqual(plan.text, "INSERT INTO `shop`.`t` () VALUES ()")
+        XCTAssertEqual(plan.values, [])
+    }
+
+    func testInsertRejectsDangerousDuplicateAndInvalidFieldNames() {
+        assertPlanThrows(containing: "dangerous key") {
+            try MySQLChangePlanner.planInsert(
+                database: "shop", table: "t", entries: [("__proto__", .number(1))])
+        }
+        assertPlanThrows(containing: "duplicate field name") {
+            try MySQLChangePlanner.planInsert(
+                database: "shop", table: "t",
+                entries: [("a", .number(1)), ("a", .number(2))])
+        }
+        assertPlanThrows(containing: "invalid field name") {
+            try MySQLChangePlanner.planInsert(
+                database: "shop", table: "t", entries: [("a\0b", .number(1))])
+        }
+    }
+
+    /// Insert values are catalog-ordered and unknown columns rejected by the
+    /// same mapper as edits — generated columns (excluded from the metadata)
+    /// can never be targeted.
+    func testInsertValuesReuseTheEditMappingRules() throws {
+        let metadata = try MySQLChangePlanner.changeTableMetadata(rows: [
+            ("id", "int", 1),
+            ("note", "text", 0),
+        ])
+        let entries = try MySQLChangeMapper.orderedEntries(
+            ["note": .string("x"), "id": .number(7)],
+            metadata: metadata,
+            label: "MySQL insert values")
+        XCTAssertEqual(entries.map(\.column), ["id", "note"])
+
+        XCTAssertThrowsError(try MySQLChangeMapper.orderedEntries(
+            ["generated_col": .number(1)],
+            metadata: metadata,
+            label: "MySQL insert values"
+        ))
+    }
 }

@@ -11,22 +11,47 @@
 #   dbbbb.app
 #   dbbbb-<version>-macOS-<arch>.zip
 #
-# Signing: AD-HOC ONLY (codesign --sign -). This machine currently has zero
-# valid codesigning identities (`security find-identity -v -p codesigning`),
-# so Developer ID signing and notarization are not possible here.
+# Signing: prefers the local self-signed identity "dbbbb Local Code Signing"
+# (dedicated keychain ~/Library/Keychains/dbbbb-signing.keychain-db); falls
+# back to ad-hoc (codesign --sign -) when that identity is absent. Developer
+# ID signing and notarization require real Apple credentials, which this
+# machine does not have.
 #
-# Keychain caveat: an ad-hoc signature's designated requirement is anchored
-# on the binary's cdhash — a hash of the binary's contents that changes with
-# every rebuild. Keychain items (service names like `dev.dbbbb.connection`)
-# are therefore NOT seamlessly shared across rebuilds: macOS re-prompts for
-# authorization each time the binary changes, even with an unchanged bundle
-# identifier. Once the app is signed with a Developer ID, the designated
-# requirement anchors on the team ID + bundle identifier instead, which is
-# stable across builds, so Keychain items created by earlier properly signed
-# builds stay accessible without re-prompting.
+# Why the local identity matters — Keychain stability across rebuilds:
+# an ad-hoc signature's designated requirement is anchored on the binary's
+# cdhash, which changes with every rebuild, so macOS treats each new build as
+# a different app and re-prompts (or silently fails) when reading Keychain
+# items like `dev.dbbbb.connection`. The self-signed identity anchors the
+# designated requirement on the certificate instead (`certificate leaf =
+# H"..."`), which is stable across rebuilds — existing connections keep
+# working after an update. Gatekeeper still rejects it (right-click → Open),
+# same as ad-hoc. One-time caveat: items written by earlier ad-hoc builds are
+# re-authorized once under the new identity, then stable forever.
+#
+# Recreating the identity on another machine (idempotent):
+#   TMP=$(mktemp -d)
+#   openssl req -x509 -newkey rsa:2048 -keyout "$TMP/key.pem" -out "$TMP/cert.pem" \
+#     -days 3650 -nodes -subj "/CN=dbbbb Local Code Signing" \
+#     -addext "keyUsage=critical,digitalSignature" \
+#     -addext "extendedKeyUsage=critical,codeSigning"
+#   openssl pkcs12 -export -legacy -out "$TMP/id.p12" -inkey "$TMP/key.pem" \
+#     -in "$TMP/cert.pem" -passout pass:<kc-password>
+#   security create-keychain -p <kc-password> ~/Library/Keychains/dbbbb-signing.keychain-db
+#   security unlock-keychain -p <kc-password> ~/Library/Keychains/dbbbb-signing.keychain-db
+#   security import "$TMP/id.p12" -k ~/Library/Keychains/dbbbb-signing.keychain-db \
+#     -P <kc-password> -T /usr/bin/codesign
+#   security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+#     -k <kc-password> ~/Library/Keychains/dbbbb-signing.keychain-db
+#   security list-keychains -d user -s login.keychain-db \
+#     ~/Library/Keychains/dbbbb-signing.keychain-db
+#   security add-generic-password -s "dbbbb-local-signing-keychain" -a dbbbb -w <kc-password> -U
+#   (the -legacy flag is required: macOS rejects OpenSSL 3's default PKCS12 MAC)
+#   (note: `security find-identity` does NOT list this identity on macOS 26,
+#    but codesign --keychain resolves it fine — detection below uses
+#    find-certificate instead)
 #
 # ── Upgrading to Developer ID + notarization once credentials exist ──
-# Replace the ad-hoc codesign step below with:
+# Replace the signing step below with:
 #
 #   1. Sign with your Developer ID Application identity + hardened runtime:
 #        codesign --force --deep --options runtime --timestamp \
@@ -171,12 +196,26 @@ for spec in "16:16" "32:16" "32:32" "64:32" "128:128" "256:128" "256:256" "512:2
 done
 iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
 
-# ── 5. Ad-hoc code signing ───────────────────────────────────────────────────
-# Hardened runtime (--options runtime) works fine with ad-hoc signing and
+# ── 5. Code signing (local stable identity, ad-hoc fallback) ────────────────
+# Hardened runtime (--options runtime) works with both signing modes and
 # keeps the bundle ready for notarization later; if it ever breaks execution,
 # drop that flag and re-test the smoke launch below.
-echo "==> Ad-hoc signing (codesign --sign -)"
-codesign --force --deep --options runtime --sign - "$APP_DIR"
+SIGNING_KEYCHAIN="$HOME/Library/Keychains/dbbbb-signing.keychain-db"
+SIGNING_IDENTITY="dbbbb Local Code Signing"
+if [[ -f "$SIGNING_KEYCHAIN" ]] \
+  && security find-certificate -c "$SIGNING_IDENTITY" "$SIGNING_KEYCHAIN" >/dev/null 2>&1; then
+  echo "==> Signing with local identity '$SIGNING_IDENTITY' (stable Keychain identity)"
+  if KC_PASSWORD=$(security find-generic-password -s "dbbbb-local-signing-keychain" -w 2>/dev/null); then
+    security unlock-keychain -p "$KC_PASSWORD" "$SIGNING_KEYCHAIN"
+  fi
+  codesign --keychain "$SIGNING_KEYCHAIN" --force --deep --options runtime \
+    --sign "$SIGNING_IDENTITY" "$APP_DIR"
+else
+  echo "==> Ad-hoc signing (codesign --sign -)"
+  echo "    (no local identity; Keychain items will re-prompt on the next rebuild —"
+  echo "     see the header comment for creating the stable local identity)"
+  codesign --force --deep --options runtime --sign - "$APP_DIR"
+fi
 
 echo "==> Verifying signature"
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"

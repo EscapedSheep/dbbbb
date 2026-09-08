@@ -313,4 +313,31 @@ public enum SQLiteChangePlanner {
             ].joined(separator: "\n"),
             values: values)
     }
+
+    /// Plans one row insert. There is no optimistic lock (the row does not
+    /// exist yet); the same field-name validation as updates applies. Values
+    /// bind in entry order; omitted columns take their server default, and an
+    /// empty entry list becomes `DEFAULT VALUES`. The adapter checks
+    /// `changes()` is exactly 1.
+    public static func planInsert(
+        table: String,
+        entries: [SQLiteFieldEntry]
+    ) throws -> SQLiteParameterizedPlan {
+        let qualifiedTable = try quoteIdentifier(table)
+        let validated = try validatedEntries(entries, label: "SQLite insert values")
+
+        guard !validated.isEmpty else {
+            return SQLiteParameterizedPlan(
+                text: "INSERT INTO \(qualifiedTable) DEFAULT VALUES",
+                values: [])
+        }
+        var columns: [String] = []
+        for (column, _) in validated {
+            try columns.append(quoteIdentifier(column))
+        }
+        return SQLiteParameterizedPlan(
+            text: "INSERT INTO \(qualifiedTable) (\(columns.joined(separator: ", ")))\n"
+                + "VALUES (\(validated.map { _ in "?" }.joined(separator: ", ")))",
+            values: validated.map(\.value))
+    }
 }

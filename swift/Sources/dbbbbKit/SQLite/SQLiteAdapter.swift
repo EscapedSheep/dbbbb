@@ -29,7 +29,6 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
 
     private let state: Mutex<State>
 
-    private static let previewLimit = 100
     private static let maxValueBytes = 8 * 1024 * 1024
     private static let maxErrorLength = 600
     private static let safeIntegerBound: Int64 = 9_007_199_254_740_991 // 2^53 - 1
@@ -101,16 +100,33 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
         }
     }
 
-    public func previewObject(_ object: DatabaseObject) async throws -> QueryResult {
-        guard object.kind == .table || object.kind == .view else {
+    public func previewObject(_ request: PreviewRequest) async throws -> QueryResult {
+        guard request.object.kind == .table || request.object.kind == .view else {
             throw AdapterError.notFound("This SQLite object cannot be previewed.")
         }
-        let sql = "SELECT *\nFROM \(Self.quoteIdentifier(object.name))\nLIMIT \(Self.previewLimit)"
-        return try await execute(.sql(sql), options: ExecuteOptions(maxRows: Self.previewLimit))
+        let plan = try SQLitePreviewPlanner.plan(table: request.object.name, request: request)
+        // maxRows = page size; the SQL's LIMIT is one larger, so a truncated
+        // result means a next page exists.
+        var binds: [DatabaseValue] = []
+        if let pattern = plan.filterPattern {
+            binds.append(pattern.databaseValue)
+        }
+        binds.append(contentsOf: plan.equalityBinds)
+        return try await runQuery(
+            sql: plan.sql,
+            binds: binds,
+            options: ExecuteOptions(requestID: request.requestID, maxRows: plan.limit))
     }
 
     public func execute(_ command: DatabaseCommand, options: ExecuteOptions) async throws -> QueryResult {
         guard case .sql(let sql) = command else { throw AdapterError.engineMismatch }
+        return try await runQuery(sql: sql, binds: [], options: options)
+    }
+
+    /// The shared execution core for ad-hoc SQL and planned previews.
+    /// `binds` are the preview filter's bound `?` arguments — they never
+    /// enter the SQL text.
+    private func runQuery(sql: String, binds: [DatabaseValue], options: ExecuteOptions) async throws -> QueryResult {
         guard !sql.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw SQLiteAdapterError("SQLite query cannot be empty.")
         }
@@ -151,7 +167,7 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
 
         do {
             let fetched = try await queue.read { db in
-                try Self.fetchRows(db: db, sql: sql, options: options)
+                try Self.fetchRows(db: db, sql: sql, options: options, binds: binds)
             }
             let elapsed = max(0, Int(Date().timeIntervalSince(startedAt) * 1000))
             return .rows(
@@ -200,14 +216,21 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
         var truncated = false
     }
 
-    private static func fetchRows(db: Database, sql: String, options: ExecuteOptions) throws -> FetchedRows {
+    private static func fetchRows(
+        db: Database,
+        sql: String,
+        options: ExecuteOptions,
+        binds: [DatabaseValue] = []
+    ) throws -> FetchedRows {
         let statement = try db.makeStatement(sql: sql)
         var fetched = FetchedRows(
             columnNames: statement.columnNames,
             trackers: [ColumnTracker](repeating: ColumnTracker(), count: statement.columnNames.count)
         )
 
-        let cursor = try Row.fetchCursor(statement)
+        let cursor = try Row.fetchCursor(
+            statement,
+            arguments: binds.isEmpty ? nil : StatementArguments(binds))
         while let row = try cursor.next() {
             if fetched.rows.count >= options.maxRows {
                 fetched.truncated = true
@@ -329,7 +352,9 @@ public final class SQLiteAdapter: DatabaseAdapter, Sendable {
 
     // MARK: - Identifiers
 
-    private static func quoteIdentifier(_ name: String) -> String {
+    /// Double-quote a SQLite identifier (double quotes doubled), same rule
+    /// the preview path uses. Also used by `SelectStatementBuilder`.
+    public static func quoteIdentifier(_ name: String) -> String {
         "\"\(name.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
@@ -497,32 +522,40 @@ extension SQLiteAdapter: SupportsEditing {
                          primaryKeyOrdinal: row["pk"] as Int)
                     })
 
-                let original = try SQLiteChangeMapper.orderedEntries(
-                    change.original, metadata: metadata, label: "SQLite original values")
-                let current: [SQLiteFieldEntry]?
-                switch change.operation {
-                case .update(let changed):
-                    current = try SQLiteChangeMapper.currentEntries(
-                        original: original, changed: changed)
-                case .delete:
-                    current = nil
-                }
-                let primaryKey = try SQLiteChangeMapper.primaryKeyEntries(
-                    metadata: metadata, original: original)
-
                 let plan: SQLiteParameterizedPlan
-                if let current {
-                    plan = try SQLiteChangePlanner.planUpdate(
-                        table: table, columnTypes: metadata.columnTypes,
+                let bindColumns: [String]
+                switch change.operation {
+                case .insert(let values):
+                    // No optimistic lock for a row that does not exist yet; the
+                    // reviewed values are catalog-ordered like the original patch.
+                    let entries = try SQLiteChangeMapper.orderedEntries(
+                        values, metadata: metadata, label: "SQLite insert values")
+                    plan = try SQLiteChangePlanner.planInsert(table: table, entries: entries)
+                    bindColumns = entries.map(\.column)
+                case .update, .delete:
+                    let original = try SQLiteChangeMapper.orderedEntries(
+                        change.original, metadata: metadata, label: "SQLite original values")
+                    let current: [SQLiteFieldEntry]?
+                    if case .update(let changed) = change.operation {
+                        current = try SQLiteChangeMapper.currentEntries(
+                            original: original, changed: changed)
+                    } else {
+                        current = nil
+                    }
+                    let primaryKey = try SQLiteChangeMapper.primaryKeyEntries(
+                        metadata: metadata, original: original)
+                    if let current {
+                        plan = try SQLiteChangePlanner.planUpdate(
+                            table: table, columnTypes: metadata.columnTypes,
+                            primaryKey: primaryKey, original: original, current: current)
+                    } else {
+                        plan = try SQLiteChangePlanner.planDelete(
+                            table: table, columnTypes: metadata.columnTypes,
+                            primaryKey: primaryKey, original: original)
+                    }
+                    bindColumns = SQLiteChangeMapper.bindColumns(
                         primaryKey: primaryKey, original: original, current: current)
-                } else {
-                    plan = try SQLiteChangePlanner.planDelete(
-                        table: table, columnTypes: metadata.columnTypes,
-                        primaryKey: primaryKey, original: original)
                 }
-
-                let bindColumns = SQLiteChangeMapper.bindColumns(
-                    primaryKey: primaryKey, original: original, current: current)
                 guard bindColumns.count == plan.values.count else {
                     throw SQLiteAdapterError("SQLite change planning failed.")
                 }
@@ -556,6 +589,295 @@ extension SQLiteAdapter: SupportsEditing {
             throw error
         } catch {
             throw Self.sanitizedError("SQLite data change failed", error, filePath: filePath)
+        }
+    }
+
+    /// Insertable columns for building insert drafts — the same introspection
+    /// and validation as `applyDataChange` (hidden/generated columns
+    /// excluded). Reading metadata is a read: read-only profiles still allow it.
+    public func insertableColumns(for object: DatabaseObject) async throws -> [InsertableColumn] {
+        guard object.kind == .table else {
+            throw AdapterError.notFound("SQLite insert drafts require an introspected table target.")
+        }
+        let table = object.name
+        let queue = try currentQueue()
+        do {
+            return try await queue.read { db in
+                let metadataRows = try Row.fetchAll(
+                    db, sql: SQLiteChangePlanner.listTableChangeColumnsSQL, arguments: [table])
+                let metadata = try SQLiteChangePlanner.changeTableMetadata(
+                    rows: metadataRows.map { row in
+                        (name: row["name"] as String,
+                         declaredType: row["type"] as String,
+                         primaryKeyOrdinal: row["pk"] as Int)
+                    })
+                let ordinals = Dictionary(
+                    metadata.primaryKey.enumerated().map { ($0.element, $0.offset + 1) }) { first, _ in first }
+                return metadata.columns.map {
+                    InsertableColumn(name: $0, primaryKeyOrdinal: ordinals[$0] ?? 0)
+                }
+            }
+        } catch let error as SQLiteChangePlanError {
+            throw error
+        } catch let error as SQLiteAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            throw Self.sanitizedError("Could not read the SQLite table columns", error, filePath: filePath)
+        }
+    }
+}
+
+
+// MARK: - Introspection
+
+extension SQLiteAdapter: SupportsIntrospection {
+    /// sqlite_master stores the original CREATE text verbatim; the name
+    /// lookup is parameterized so unusual identifiers stay safe. `sql` is
+    /// NULL for internal objects (auto-indexes), which the object list never
+    /// surfaces. Reading DDL is a read: allowed on read-only profiles.
+    private static let createStatementSQL = """
+        SELECT sql
+        FROM sqlite_master
+        WHERE name = ?
+          AND type IN ('table', 'view')
+        """
+
+    public func createStatement(for object: DatabaseObject) async throws -> String {
+        guard object.kind == .table || object.kind == .view else {
+            throw AdapterError.notFound("SQLite create statements require a table or view target.")
+        }
+        let queue = try currentQueue()
+        do {
+            return try await queue.read { db in
+                guard let ddl = try String.fetchOne(
+                    db, sql: Self.createStatementSQL, arguments: [object.name]),
+                    !ddl.isEmpty
+                else {
+                    throw AdapterError.notFound("This SQLite object has no stored create statement.")
+                }
+                return ddl
+            }
+        } catch let error as SQLiteAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            throw Self.sanitizedError(
+                "Could not read the SQLite create statement", error, filePath: filePath)
+        }
+    }
+}
+
+// MARK: - Foreign keys
+
+extension SQLiteAdapter: SupportsForeignKeys {
+    /// Foreign keys of one introspected table (ROADMAP M1 ⑤), grouped by
+    /// constraint id in column order. The table name crosses as a bound
+    /// argument to the table-valued pragma. `REFERENCES t` without a column
+    /// list reports a NULL target column; those are resolved through the
+    /// referenced table's primary key. Reading metadata is a read: read-only
+    /// profiles still allow it.
+    public func foreignKeys(for object: DatabaseObject) async throws -> [dbbbbCore.ForeignKey] {
+        guard object.kind == .table else {
+            throw AdapterError.notFound("SQLite foreign keys require an introspected table target.")
+        }
+        return try await foreignKeys(named: object.name)
+    }
+
+    /// The shared per-table foreign-key read behind `foreignKeys(for:)` and
+    /// the database-wide `allForeignKeys()`.
+    private func foreignKeys(named tableName: String) async throws -> [dbbbbCore.ForeignKey] {
+        let queue = try currentQueue()
+        do {
+            return try await queue.read { db in
+                let rows = try Row.fetchAll(
+                    db, sql: SQLiteForeignKeyPlanner.listForeignKeysSQL,
+                    arguments: [tableName])
+                var parsed: [(id: Int, column: String, referencedTable: String,
+                              referencedColumn: String?)] = []
+                var implicitTables: Set<String> = []
+                for row in rows {
+                    guard let id: Int = row["id"], let column: String = row["from"],
+                          let referencedTable: String = row["table"]
+                    else {
+                        throw SQLiteAdapterError("SQLite returned invalid foreign-key metadata.")
+                    }
+                    let referencedColumn: String? = row["to"]
+                    if referencedColumn == nil { implicitTables.insert(referencedTable) }
+                    parsed.append((id, column, referencedTable, referencedColumn))
+                }
+                var implicitColumns: [String: [String]] = [:]
+                for table in implicitTables {
+                    implicitColumns[table] = try String.fetchAll(
+                        db, sql: SQLiteForeignKeyPlanner.implicitReferencedColumnsSQL,
+                        arguments: [table])
+                }
+                return try SQLiteForeignKeyPlanner.foreignKeys(
+                    rows: parsed, implicitColumns: implicitColumns)
+            }
+        } catch let error as SQLiteAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            throw Self.sanitizedError("Could not read the SQLite foreign keys", error, filePath: filePath)
+        }
+    }
+}
+
+// MARK: - Table statistics
+
+extension SQLiteAdapter: SupportsTableStatistics {
+    /// SQLite has no planner estimates: `COUNT(*)` is the only truthful
+    /// count (ROADMAP M2 ⑩). It runs through the normal query path, so the
+    /// timeout watchdog and `cancel(requestID:)` interrupt it exactly like
+    /// user SQL. Sizes are file-level — `page_count × page_size` covers the
+    /// whole database file (per-object sizes need the optional dbstat vtab,
+    /// which is not guaranteed), and the sheet says so through `extras`.
+    /// Views report rows only. Reading statistics is a read: read-only
+    /// profiles still allow it.
+    public func tableStatistics(for object: DatabaseObject) async throws -> TableStatistics {
+        guard object.kind == .table || object.kind == .view else {
+            throw AdapterError.notFound("SQLite statistics require a table or view target.")
+        }
+        let countSQL = "SELECT COUNT(*) FROM \(SQLiteAdapter.quoteIdentifier(object.name))"
+        let counted = try await runQuery(
+            sql: countSQL, binds: [], options: ExecuteOptions(maxRows: 1))
+        guard case .rows(_, let rows, _) = counted,
+              let row = rows.first, let countCell = row.first
+        else {
+            throw SQLiteAdapterError("SQLite returned invalid statistics metadata.")
+        }
+        let estimatedRows: Int64?
+        switch countCell {
+        case .number(let value) where value.isFinite && value >= 0 && value <= Double(Int64.max):
+            estimatedRows = Int64(value)
+        default:
+            estimatedRows = nil
+        }
+        guard object.kind == .table else {
+            return TableStatistics(estimatedRows: estimatedRows)
+        }
+        let queue = try currentQueue()
+        do {
+            return try await queue.read { db in
+                let pageCount = try Int64.fetchOne(db, sql: "PRAGMA page_count") ?? 0
+                let pageSize = try Int64.fetchOne(db, sql: "PRAGMA page_size") ?? 0
+                let (totalBytes, overflow) = pageCount.multipliedReportingOverflow(by: pageSize)
+                return TableStatistics(
+                    estimatedRows: estimatedRows,
+                    totalBytes: overflow ? nil : totalBytes,
+                    indexBytes: nil,
+                    extras: [TableStatistics.Entry(
+                        name: "Size scope", value: "Whole database file")])
+            }
+        } catch let error as SQLiteAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            throw Self.sanitizedError("Could not read the SQLite statistics", error, filePath: filePath)
+        }
+    }
+}
+
+// MARK: - Schema introspection
+
+extension SQLiteAdapter: SupportsSchemaIntrospection {
+    /// Structured schema of one table or view: columns with nullability and
+    /// primary-key ordinals (`pragma_table_info`), indexes
+    /// (`pragma_index_list` + `pragma_index_info` per index), and foreign
+    /// keys (tables only — views have none). Reading metadata is a read:
+    /// read-only profiles still allow it.
+    public func schema(for object: DatabaseObject) async throws -> dbbbbCore.TableSchema {
+        guard object.kind == .table || object.kind == .view else {
+            throw AdapterError.notFound("SQLite schemas require a table or view target.")
+        }
+        let queue = try currentQueue()
+        do {
+            let (columns, indexes) = try await queue.read { db in
+                let columnRows = try Row.fetchAll(
+                    db, sql: SQLiteSchemaPlanner.listColumnsSQL,
+                    arguments: [object.name])
+                var parsedColumns: [(name: String, dataType: String, notNull: Bool,
+                                     primaryKeyOrdinal: Int)] = []
+                for row in columnRows {
+                    guard let name: String = row["name"],
+                          let dataType: String = row["type"],
+                          let notNull: Int = row["notnull"],
+                          let ordinal: Int = row["pk"]
+                    else {
+                        throw SQLiteAdapterError("SQLite returned invalid schema metadata.")
+                    }
+                    parsedColumns.append((name, dataType, notNull != 0, ordinal))
+                }
+                let columns = try SQLiteSchemaPlanner.columns(rows: parsedColumns)
+
+                let indexRows = try Row.fetchAll(
+                    db, sql: SQLiteSchemaPlanner.listIndexesSQL,
+                    arguments: [object.name])
+                var parsedIndexes: [(name: String, isUnique: Bool)] = []
+                for row in indexRows {
+                    guard let name: String = row["name"],
+                          let unique: Int = row["unique"]
+                    else {
+                        throw SQLiteAdapterError("SQLite returned invalid schema metadata.")
+                    }
+                    parsedIndexes.append((name, unique != 0))
+                }
+                var indexColumns: [String: [String]] = [:]
+                for index in parsedIndexes {
+                    indexColumns[index.name] = try String.fetchAll(
+                        db, sql: SQLiteSchemaPlanner.listIndexColumnsSQL,
+                        arguments: [index.name])
+                }
+                let indexes = try SQLiteSchemaPlanner.indexes(
+                    rows: parsedIndexes, columns: indexColumns)
+                return (columns, indexes)
+            }
+            let keys: [dbbbbCore.ForeignKey] =
+                object.kind == .table ? try await foreignKeys(for: object) : []
+            return dbbbbCore.TableSchema(
+                object: object, columns: columns, foreignKeys: keys, indexes: indexes)
+        } catch let error as SQLiteAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            throw Self.sanitizedError("Could not read the SQLite schema", error, filePath: filePath)
+        }
+    }
+
+    /// Every foreign-key edge of the database file, one per user table,
+    /// reusing the per-table read (implicit-PK references resolved). Reading
+    /// metadata is a read: read-only profiles still allow it.
+    public func allForeignKeys() async throws -> [dbbbbCore.TableRelation] {
+        let queue = try currentQueue()
+        do {
+            let tables = try await queue.read { db in
+                try String.fetchAll(db, sql: SQLiteSchemaPlanner.listTablesSQL)
+            }
+            var relations: [dbbbbCore.TableRelation] = []
+            for table in tables {
+                let keys = try await foreignKeys(named: table)
+                let object = DatabaseObject(
+                    id: SQLiteAdapter.objectID(kind: .table, name: table),
+                    parentID: SQLiteAdapter.objectID(kind: .schema, name: nil),
+                    name: table,
+                    kind: .table)
+                relations.append(contentsOf: keys.map {
+                    dbbbbCore.TableRelation(object: object, foreignKey: $0)
+                })
+            }
+            return relations
+        } catch let error as SQLiteAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            throw Self.sanitizedError("Could not read the SQLite foreign keys", error, filePath: filePath)
         }
     }
 }

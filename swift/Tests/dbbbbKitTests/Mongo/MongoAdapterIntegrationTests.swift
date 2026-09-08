@@ -272,6 +272,74 @@ struct MongoAdapterIntegrationTests {
         await adapter.close()
     }
 
+    /// Insert round trip (ROADMAP M1 ③): a document without `_id` gets a
+    /// server-generated one, an explicit tagged `_id` keeps its BSON type,
+    /// and a duplicate `_id` surfaces the unique-index wording.
+    @Test(.enabled(if: MongoAdapterIntegrationTests.mongoURL != nil))
+    func applyDataChangeInsert() async throws {
+        try await Self.seedEditCollection(documents: [])
+        let adapter = try await Self.makeAdapter()
+        let objects = try await adapter.listObjects()
+        let collection = try Self.editingCollectionObject(from: objects)
+
+        // Missing _id: generated server-side; tagged values keep their type.
+        _ = try await adapter.applyDataChange(DataChange(
+            object: collection,
+            original: [:],
+            operation: .insert(values: [
+                "token": .string(Self.editToken),
+                "name": .string("inserted"),
+                "price": .object([("$numberDecimal", .string("0.1"))]),
+            ])))
+        // Explicit tagged _id.
+        _ = try await adapter.applyDataChange(DataChange(
+            object: collection,
+            original: [:],
+            operation: .insert(values: [
+                "_id": .object([("$oid", .string("0d0d0d0d0d0d0d0d0d0d0d0d"))]),
+                "token": .string(Self.editToken),
+            ])))
+
+        let found = try await Self.findEditDocuments(adapter)
+        #expect(found.count == 2)
+        let records = found.map(Self.record)
+        let generated = try #require(records.first { $0["name"] == .string("inserted") })
+        #expect(generated["_id"] != nil)
+        #expect(generated["price"] == .object([("$numberDecimal", .string("0.1"))]))
+        #expect(records.contains {
+            $0["_id"] == .object([("$oid", .string("0d0d0d0d0d0d0d0d0d0d0d0d"))])
+        })
+
+        // Reinserting the same explicit _id violates the unique index.
+        await #expect { @Sendable in
+            _ = try await adapter.applyDataChange(DataChange(
+                object: collection,
+                original: [:],
+                operation: .insert(values: [
+                    "_id": .object([("$oid", .string("0d0d0d0d0d0d0d0d0d0d0d0d"))]),
+                ])))
+        } throws: { error in
+            (error as? dbbbbError)?.userMessage.contains("unique index") == true
+        }
+
+        // Read-only sessions refuse inserts client-side.
+        let url = try #require(Self.mongoURL)
+        let database = ProcessInfo.processInfo.environment["DBBBB_TEST_MONGO_DB"] ?? "dbbbb_test"
+        let tls = url.lowercased().hasPrefix("mongodb+srv://") || url.contains("tls=true")
+        let readOnlyAdapter = try await MongoAdapter(input: ConnectionInput.MongoInput(
+            name: "integration", uri: url, database: database, tls: tls, readOnly: true))
+        await #expect { @Sendable in
+            _ = try await readOnlyAdapter.applyDataChange(DataChange(
+                object: collection,
+                original: [:],
+                operation: .insert(values: ["token": .string(Self.editToken)])))
+        } throws: { error in
+            (error as? dbbbbError)?.userMessage.contains("read-only") == true
+        }
+        await readOnlyAdapter.close()
+        await adapter.close()
+    }
+
     // MARK: - Import
 
     private static let importCollection = "dbbbb_it_import"

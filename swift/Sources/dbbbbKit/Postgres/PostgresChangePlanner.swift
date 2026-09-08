@@ -368,4 +368,41 @@ public enum PostgresChangePlanner {
             ].joined(separator: "\n"),
             values: values)
     }
+
+    /// Plans one row insert. There is no optimistic lock (the row does not
+    /// exist yet); the same field-name validation as updates applies. Values
+    /// bind in entry order (`$1…`); omitted columns take their server
+    /// default, and an empty entry list becomes `DEFAULT VALUES`.
+    /// `RETURNING *` yields the inserted row — zero rows means a trigger or
+    /// RLS policy intercepted the write, reported with the same
+    /// conflict wording as updates.
+    public static func planInsert(
+        schema: String,
+        table: String,
+        entries: [PostgresFieldEntry]
+    ) throws -> PostgresParameterizedPlan {
+        let qualifiedTable = try "\(quoteIdentifier(schema)).\(quoteIdentifier(table))"
+        let validated = try validatedEntries(entries, label: "PostgreSQL insert values")
+
+        guard !validated.isEmpty else {
+            return PostgresParameterizedPlan(
+                text: "INSERT INTO \(qualifiedTable) DEFAULT VALUES\nRETURNING *;",
+                values: [])
+        }
+        var values: [DisplayValue] = []
+        var columns: [String] = []
+        var placeholders: [String] = []
+        for (column, value) in validated {
+            values.append(value)
+            try columns.append(quoteIdentifier(column))
+            placeholders.append("$\(values.count)")
+        }
+        return PostgresParameterizedPlan(
+            text: [
+                "INSERT INTO \(qualifiedTable) (\(columns.joined(separator: ", ")))",
+                "VALUES (\(placeholders.joined(separator: ", ")))",
+                "RETURNING *;",
+            ].joined(separator: "\n"),
+            values: values)
+    }
 }

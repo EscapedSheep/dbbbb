@@ -345,4 +345,33 @@ public enum MySQLChangePlanner {
             ].joined(separator: "\n"),
             values: values)
     }
+
+    /// Plans one row insert. There is no optimistic lock (the row does not
+    /// exist yet); the same field-name validation as updates applies. Values
+    /// bind in entry order; omitted columns take their server default, and an
+    /// empty entry list becomes `INSERT … () VALUES ()` (all defaults).
+    /// MySQL has no `RETURNING`; the adapter checks the OK packet's
+    /// affected-row count is exactly 1.
+    public static func planInsert(
+        database: String,
+        table: String,
+        entries: [MySQLFieldEntry]
+    ) throws -> MySQLParameterizedPlan {
+        let qualifiedTable = try "\(quoteIdentifier(database)).\(quoteIdentifier(table))"
+        let validated = try validatedEntries(entries, label: "MySQL insert values")
+
+        guard !validated.isEmpty else {
+            return MySQLParameterizedPlan(
+                text: "INSERT INTO \(qualifiedTable) () VALUES ()",
+                values: [])
+        }
+        var columns: [String] = []
+        for (column, _) in validated {
+            try columns.append(quoteIdentifier(column))
+        }
+        return MySQLParameterizedPlan(
+            text: "INSERT INTO \(qualifiedTable) (\(columns.joined(separator: ", ")))\n"
+                + "VALUES (\(validated.map { _ in "?" }.joined(separator: ", ")))",
+            values: validated.map(\.value))
+    }
 }

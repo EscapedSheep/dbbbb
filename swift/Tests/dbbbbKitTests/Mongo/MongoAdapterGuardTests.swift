@@ -34,6 +34,27 @@ struct MongoAdapterGuardTests {
         #expect { try MongoAdapter.effectiveURI(input: input) } throws: { _ in true }
     }
 
+    /// Empty-database browsing is deliberately unsupported (the command
+    /// contract carries no database); the adapter boundary rejects it before
+    /// any network I/O.
+    @Test func emptyDatabaseRejected() async {
+        let input = ConnectionInput.MongoInput(
+            name: "x", uri: "mongodb://localhost:27017", database: "  ", tls: false
+        )
+        do {
+            _ = try await MongoAdapter(input: input)
+            Issue.record("an empty database must be rejected")
+        } catch let error as MongoAdapterError {
+            guard case .invalidConfiguration(let message) = error else {
+                Issue.record("wrong error: \(error)")
+                return
+            }
+            #expect(message.contains("require a database"))
+        } catch {
+            Issue.record("wrong error type: \(error)")
+        }
+    }
+
     // MARK: URI normalization
 
     @Test func effectiveURIRewritesTLSParam() throws {

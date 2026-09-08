@@ -158,4 +158,44 @@ final class ResultExportTests: XCTestCase {
         XCTAssertEqual(try CanonicalJSON.serialize(.number(-0.5)), "-0.5")
         XCTAssertEqual(try CanonicalJSON.serialize(.null), "null")
     }
+
+    // MARK: - INSERT-statement export
+
+    func testInsertStatementsExportRendersSQLFile() throws {
+        let columns = [
+            ColumnMeta(name: "id", typeName: "int", numeric: true),
+            ColumnMeta(name: "name", typeName: "text"),
+            ColumnMeta(name: "note", typeName: "text"),
+        ]
+        let result = QueryResult.rows(
+            columns: columns,
+            rows: [[.number(1), .string("o'clock"), .null]],
+            meta: meta)
+        let exported = try ResultExporter.exportData(
+            for: result, format: .insertStatements(table: ["public", "people"]))
+        XCTAssertEqual(exported.fileExtension, "sql")
+        XCTAssertEqual(exported.rows, 1)
+        XCTAssertEqual(
+            String(decoding: exported.data, as: UTF8.self),
+            "INSERT INTO \"public\".\"people\" (\"id\", \"name\", \"note\") VALUES (1, 'o''clock', NULL);\n")
+    }
+
+    /// Document results stay JSONL-only; asking for INSERT statements fails
+    /// closed. Fail-closed values (binary) fail the export as in CSV.
+    func testInsertStatementsExportFailsClosed() {
+        let documents = QueryResult.documents([.object([("a", .number(1))])], meta: meta)
+        XCTAssertThrowsError(try ResultExporter.exportData(
+            for: documents, format: .insertStatements(table: ["t"]))) { error in
+            XCTAssertEqual(error as? ResultExportError, .invalidShape)
+        }
+
+        let rows = QueryResult.rows(
+            columns: [ColumnMeta(name: "payload", typeName: "blob")],
+            rows: [[.binary(Data([1]))]],
+            meta: meta)
+        XCTAssertThrowsError(try ResultExporter.exportData(
+            for: rows, format: .insertStatements(table: ["t"]))) { error in
+            XCTAssertEqual(error as? ResultExportError, .unsupportedValue)
+        }
+    }
 }

@@ -12,7 +12,9 @@ dbbbb is a local-first, open-source macOS database client for PostgreSQL, MySQL,
 ## What works now
 
 - Real connections to all four engines. PostgreSQL, MySQL support `disable`, `require`, and `verify-full` SSL modes; MongoDB supports SRV URIs with TLS enforced. SQLite opens local database files, optionally read-only.
-- Object browsing, generated previews, and query execution with bounded results (500 rows / 5 MiB per result, 8 MiB per single value with an explicit truncation marker), targeted cancellation, and redacted error messages that never leak passwords, URIs, or local paths.
+- Object browsing, generated previews, and query execution with bounded results (500 rows / 5 MiB per result, 8 MiB per single value with an explicit truncation marker), targeted cancellation, and redacted error messages that never leak passwords, URIs, or local paths. Double-click a table or view to run its `SELECT … LIMIT 100` instantly (a MongoDB collection runs its find).
+- View Create Statement for tables and views on PostgreSQL, MySQL, and SQLite: the DDL opens read-only in a monospaced, copyable sheet (a fail-closed capability — MongoDB and unsupported adapters never show it).
+- Optional database field: PostgreSQL falls back to the `postgres` maintenance database; MySQL connects without a default schema and browses all non-system schemas server-wide.
 - Read-only connections enforced twice: a client-side statement classifier plus server-side read-only settings.
 - Reviewed single-record update/delete on all four engines: draft → review two-phase flow, optimistic conflict detection, and an extra typed confirmation on production profiles. Editing is a fail-closed capability — read-only profiles, non-preview results, or unsupported adapters simply never show edit entry points.
 - CSV import into SQL tables and JSONL import into MongoDB collections (batched, bounded, cancellable); CSV and canonical JSONL export of the current bounded result, written atomically.

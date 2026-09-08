@@ -91,6 +91,32 @@ struct SessionStoreConnectionTests {
         #expect(store.errorMessage == nil)
     }
 
+    /// Regression: an unreachable server must surface a real error fast — the
+    /// Add sheet used to spin forever because adapter internals can sit on
+    /// futures that ignore task cancellation.
+    @Test func addConnectionTimesOutAndCanBeRetried() async throws {
+        let store = makeStore()
+        store.connectProbeTimeout = .milliseconds(100)
+
+        let hanging = StubAdapter(name: "Hanging")
+        hanging.listObjectsDelay = .seconds(3600)
+        store.makeAdapter = { _ in hanging }
+
+        do {
+            try await store.addConnection(.sqlite(.init(name: "Hanging", filePath: "hanging.db")))
+            Issue.record("an unreachable server must fail instead of spinning forever")
+        } catch let error as SessionStore.ConnectProbeTimeoutError {
+            #expect(error.userMessage.contains("did not respond in time"))
+        }
+        #expect(!store.sessions.contains { $0.profile.name == "Hanging" })
+
+        // The sheet stays usable: a corrected attempt succeeds right away.
+        let healthy = StubAdapter(name: "Healthy")
+        store.makeAdapter = { _ in healthy }
+        try await store.addConnection(.sqlite(.init(name: "Healthy", filePath: "healthy.db")))
+        #expect(store.sessions.contains { $0.profile.name == "Healthy" })
+    }
+
     @Test func editingObjectFailsClosedForDemoProfiles() async throws {
         let store = makeStore()
         let demoAdapter = EditingStubAdapter(demo: true)

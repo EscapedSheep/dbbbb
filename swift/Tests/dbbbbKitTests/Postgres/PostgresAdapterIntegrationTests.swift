@@ -459,6 +459,83 @@ final class PostgresAdapterIntegrationTests: XCTestCase {
                 return XCTFail("expected notFound, got \(error)")
             }
         }
+
+        // Inserts are refused on read-only sessions too.
+        do {
+            _ = try await readOnlyAdapter.applyDataChange(DataChange(
+                object: fakeTable,
+                original: [:],
+                operation: .insert(values: ["note": .string("x")])))
+            XCTFail("read-only session must refuse inserts")
+        } catch let error as PostgresAdapterError {
+            XCTAssertTrue(error.userMessage.contains("read-only"))
+        }
+    }
+
+    /// Insert round trip (ROADMAP M1 ③): insertable-column introspection
+    /// excludes the generated column, an insert omitting the serial primary
+    /// key takes server defaults and returns the row via RETURNING *, and a
+    /// duplicate-shaped insert (explicit values minus the key) does not
+    /// collide.
+    func testApplyDataChangeInsertAndDuplicate() async throws {
+        _ = try await adapter.execute(.sql("""
+            CREATE TABLE IF NOT EXISTS dbbbb_it_insert (
+                id serial PRIMARY KEY,
+                note text,
+                amount numeric(12,4) DEFAULT 1.10,
+                upper_note text GENERATED ALWAYS AS (upper(note)) STORED
+            )
+            """), options: ExecuteOptions())
+        _ = try await adapter.execute(.sql(
+            "TRUNCATE dbbbb_it_insert"), options: ExecuteOptions())
+        _ = try await adapter.execute(.sql(
+            "INSERT INTO dbbbb_it_insert (note) VALUES ('before')"), options: ExecuteOptions())
+
+        let table = try await editingTable("dbbbb_it_insert")
+
+        // The generated column never appears in the draft; the serial key is
+        // marked so the duplicate flow can blank it.
+        let insertable = try await adapter.insertableColumns(for: table)
+        XCTAssertEqual(insertable, [
+            InsertableColumn(name: "id", primaryKeyOrdinal: 1),
+            InsertableColumn(name: "note", primaryKeyOrdinal: 0),
+            InsertableColumn(name: "amount", primaryKeyOrdinal: 0),
+        ])
+
+        // New row: defaults fill id and amount; RETURNING * yields the row.
+        let inserted = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: [:],
+            operation: .insert(values: ["note": .string("new")])))
+        let (insertedColumns, insertedRows) = try rows(inserted)
+        XCTAssertEqual(insertedRows.count, 1)
+        let insertedRecord = originalRecord(columns: insertedColumns, row: insertedRows[0])
+        XCTAssertEqual(insertedRecord["note"], .string("new"))
+        XCTAssertEqual(insertedRecord["amount"], .string("1.1000"))
+        XCTAssertEqual(insertedRecord["upper_note"], .string("NEW"))
+
+        // Duplicate of the first row: everything but the primary key.
+        let duplicate = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: [:],
+            operation: .insert(values: ["note": .string("before"), "amount": .string("1.10")])))
+        let (_, duplicateRows) = try rows(duplicate)
+        XCTAssertEqual(duplicateRows.count, 1)
+
+        let (_, all) = try rows(try await adapter.execute(.sql(
+            "SELECT note FROM dbbbb_it_insert ORDER BY id"), options: ExecuteOptions()))
+        XCTAssertEqual(all.map { $0[0] }, [.string("before"), .string("new"), .string("before")])
+
+        // Unknown fields (e.g. the generated column) fail closed.
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table,
+                original: [:],
+                operation: .insert(values: ["upper_note": .string("x")])))
+            XCTFail("generated columns must be refused")
+        } catch let error as PostgresChangePlanError {
+            XCTAssertTrue(error.userMessage.contains("unknown table field"))
+        }
     }
 
     func testReadOnlySessionRejectsWritesBothSides() async throws {
@@ -582,6 +659,66 @@ final class PostgresAdapterIntegrationTests: XCTestCase {
             XCTAssertEqual(
                 error,
                 .unsupported("PostgreSQL import is disabled for read-only connections."))
+        }
+    }
+}
+
+// MARK: - Create statement (DDL reconstruction)
+
+extension PostgresAdapterIntegrationTests {
+    /// The reconstruction is verified against a real server: catalog queries
+    /// must run as written and the assembly must carry columns, NOT NULL,
+    /// defaults, the primary key, and unique indexes.
+    func testCreateStatementReconstructsTableDDL() async throws {
+        _ = try await adapter.execute(.sql("""
+            CREATE TABLE IF NOT EXISTS dbbbb_it_ddl (
+                id int4 PRIMARY KEY,
+                email text NOT NULL,
+                balance numeric(12,2) DEFAULT 0.00,
+                note text
+            )
+            """), options: ExecuteOptions())
+        _ = try await adapter.execute(.sql("""
+            CREATE UNIQUE INDEX IF NOT EXISTS dbbbb_it_ddl_email_key ON dbbbb_it_ddl (email)
+            """), options: ExecuteOptions())
+
+        let objects = try await adapter.listObjects()
+        guard let table = objects.first(where: { $0.kind == .table && $0.name == "dbbbb_it_ddl" })
+        else { return XCTFail("scratch table missing from object tree") }
+
+        let ddl = try await adapter.createStatement(for: table)
+        XCTAssertTrue(ddl.hasPrefix(#"CREATE TABLE "public"."dbbbb_it_ddl" ("#), ddl)
+        XCTAssertTrue(ddl.contains(#""id" integer NOT NULL"#), ddl)
+        XCTAssertTrue(ddl.contains(#""email" text NOT NULL"#), ddl)
+        XCTAssertTrue(ddl.contains(#""balance" numeric(12,2) DEFAULT 0.00"#), ddl)
+        XCTAssertTrue(ddl.contains(#""note" text"#), ddl)
+        XCTAssertTrue(ddl.contains(#"CONSTRAINT "dbbbb_it_ddl_pkey" PRIMARY KEY ("id")"#), ddl)
+        XCTAssertTrue(ddl.contains("CREATE UNIQUE INDEX dbbbb_it_ddl_email_key"), ddl)
+    }
+
+    func testCreateStatementReconstructsViewDDL() async throws {
+        _ = try await adapter.execute(.sql("""
+            CREATE OR REPLACE VIEW dbbbb_it_ddl_view AS SELECT 1 AS one
+            """), options: ExecuteOptions())
+        let objects = try await adapter.listObjects()
+        guard let view = objects.first(where: { $0.kind == .view && $0.name == "dbbbb_it_ddl_view" })
+        else { return XCTFail("scratch view missing from object tree") }
+
+        let ddl = try await adapter.createStatement(for: view)
+        XCTAssertTrue(ddl.hasPrefix(#"CREATE VIEW "public"."dbbbb_it_ddl_view" AS"#), ddl)
+        XCTAssertTrue(ddl.contains("1"), ddl)
+
+        // Schema nodes fail closed.
+        guard let schema = objects.first(where: { $0.kind == .schema }) else {
+            return XCTFail("schema node missing from object tree")
+        }
+        do {
+            _ = try await adapter.createStatement(for: schema)
+            XCTFail("schema nodes must fail closed")
+        } catch let error as AdapterError {
+            guard case .notFound = error else {
+                return XCTFail("wrong error: \(error)")
+            }
         }
     }
 }

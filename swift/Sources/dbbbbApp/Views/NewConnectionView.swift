@@ -15,9 +15,9 @@ struct NewConnectionView: View {
     @State private var username = ""
     @State private var password = ""
     @State private var database = ""
-    @State private var sslMode: SSLMode = .require
+    @State private var sslMode: SSLMode = .disable
     @State private var mongoURI = "mongodb://localhost:27017"
-    @State private var mongoTLS = true
+    @State private var mongoTLS = false
     @State private var sqlitePath = ""
     @State private var environment: ConnectionEnvironment = .development
     @State private var readOnly = false
@@ -27,15 +27,21 @@ struct NewConnectionView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                Picker("Engine", selection: $engine) {
-                    ForEach(DatabaseEngine.allCases, id: \.self) { engine in
-                        Text(engine.displayName).tag(engine)
+                HStack {
+                    Spacer()
+                    Picker("Engine", selection: $engine) {
+                        ForEach(DatabaseEngine.allCases, id: \.self) { engine in
+                            Text(engine.displayName).tag(engine)
+                        }
                     }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: engine) { _, newEngine in
-                    port = newEngine == .mysql ? "3306" : "5432"
-                    addError = nil
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                    .onChange(of: engine) { _, newEngine in
+                        port = newEngine == .mysql ? "3306" : "5432"
+                        addError = nil
+                    }
+                    Spacer()
                 }
 
                 Section("Connection") {
@@ -46,7 +52,11 @@ struct NewConnectionView: View {
                         TextField("Port", text: $port)
                         TextField("Username", text: $username)
                         SecureField("Password", text: $password)
-                        TextField("Database", text: $database)
+                        // Optional for both: PostgreSQL falls back to the
+                        // `postgres` maintenance database; MySQL connects
+                        // without a default schema and browses server-wide.
+                        TextField("Database", text: $database, prompt: Text(
+                            engine == .postgresql ? "postgres (default)" : "Optional — all schemas"))
                         Picker("SSL Mode", selection: $sslMode) {
                             ForEach(SSLMode.allCases, id: \.self) { mode in
                                 Text(mode.rawValue).tag(mode)
@@ -139,14 +149,15 @@ struct NewConnectionView: View {
             } else {
                 problems.append("Port must be a number between 1 and 65535.")
             }
-            if database.trimmingCharacters(in: .whitespaces).isEmpty {
-                problems.append("Database is required.")
-            }
+            // Database is optional for both SQL servers (see the field prompt).
         case .mongodb:
             let uri = mongoURI.trimmingCharacters(in: .whitespaces)
             if !uri.hasPrefix("mongodb://") && !uri.hasPrefix("mongodb+srv://") {
                 problems.append("URI must start with mongodb:// or mongodb+srv://.")
             }
+            // MongoDB still requires a database: the command contract carries
+            // no database, so the adapter runs every command against one fixed
+            // database (documented in MongoAdapter).
             if database.trimmingCharacters(in: .whitespaces).isEmpty {
                 problems.append("Database is required.")
             }
@@ -175,22 +186,23 @@ struct NewConnectionView: View {
     private func submit() {
         guard !isSubmitting else { return }
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
+        let trimmedDatabase = database.trimmingCharacters(in: .whitespaces)
         let input: ConnectionInput
         switch engine {
         case .postgresql:
             input = .postgres(.init(
                 name: trimmedName, host: host, port: Int(port) ?? 5432,
-                username: username, password: password, database: database,
+                username: username, password: password, database: trimmedDatabase,
                 sslMode: sslMode, environment: environment, readOnly: readOnly))
         case .mysql:
             input = .mysql(.init(
                 name: trimmedName, host: host, port: Int(port) ?? 3306,
-                username: username, password: password, database: database,
+                username: username, password: password, database: trimmedDatabase,
                 sslMode: sslMode, environment: environment, readOnly: readOnly))
         case .mongodb:
             input = .mongo(.init(
                 name: trimmedName, uri: mongoURI.trimmingCharacters(in: .whitespaces),
-                database: database, tls: mongoTLS,
+                database: trimmedDatabase, tls: mongoTLS,
                 environment: environment, readOnly: readOnly))
         case .sqlite:
             input = .sqlite(.init(

@@ -445,3 +445,154 @@ final class SQLiteAdapterTests: XCTestCase {
         }
     }
 }
+
+/// Real-database round trips for paged/sorted/filtered previews (M1 ①②).
+final class SQLitePreviewTests: XCTestCase {
+    /// 250 rows: three pages at the default page size (100 + 100 + 50).
+    private func makePagedFixture() throws -> SQLiteFixture {
+        try SQLiteFixture().populate([
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)",
+            """
+            INSERT INTO items (id, label)
+            WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 250)
+            SELECT x, printf('item-%04d', x) FROM c
+            """,
+        ])
+    }
+
+    private func tableObject(_ adapter: SQLiteAdapter) async throws -> DatabaseObject {
+        let objects = try await adapter.listObjects()
+        return try XCTUnwrap(objects.first { $0.kind == .table && $0.name == "items" })
+    }
+
+    private func rows(_ result: QueryResult) throws -> ([[DisplayValue]], ResultMeta) {
+        guard case .rows(_, let rows, let meta) = result else {
+            throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "expected rows"])
+        }
+        return (rows, meta)
+    }
+
+    func testPagingRoundTrip() async throws {
+        let fixture = try makePagedFixture()
+        let adapter = try fixture.makeAdapter()
+        let table = try await tableObject(adapter)
+
+        let page1 = try rows(try await adapter.previewObject(PreviewRequest(object: table, offset: 0, limit: 100)))
+        XCTAssertEqual(page1.0.count, 100)
+        XCTAssertTrue(page1.1.truncated, "rows beyond the page mean a next page exists")
+        XCTAssertEqual(page1.0.first?.first, .number(1))
+
+        let page2 = try rows(try await adapter.previewObject(PreviewRequest(object: table, offset: 100, limit: 100)))
+        XCTAssertEqual(page2.0.count, 100)
+        XCTAssertTrue(page2.1.truncated)
+        XCTAssertEqual(page2.0.first?.first, .number(101))
+
+        let page3 = try rows(try await adapter.previewObject(PreviewRequest(object: table, offset: 200, limit: 100)))
+        XCTAssertEqual(page3.0.count, 50)
+        XCTAssertFalse(page3.1.truncated, "the last page reports no next page")
+        XCTAssertEqual(page3.0.first?.first, .number(201))
+
+        // Beyond the end: an empty page, no next page.
+        let pastEnd = try rows(try await adapter.previewObject(PreviewRequest(object: table, offset: 250, limit: 100)))
+        XCTAssertEqual(pastEnd.0.count, 0)
+        XCTAssertFalse(pastEnd.1.truncated)
+    }
+
+    func testSortRoundTrip() async throws {
+        let fixture = try makePagedFixture()
+        let adapter = try fixture.makeAdapter()
+        let table = try await tableObject(adapter)
+
+        let descending = try rows(try await adapter.previewObject(PreviewRequest(
+            object: table, limit: 5,
+            sort: PreviewRequest.Sort(column: "id", ascending: false))))
+        XCTAssertEqual(descending.0.map(\.first!), [.number(250), .number(249), .number(248), .number(247), .number(246)])
+
+        // String sort: the zero-padded labels order lexically.
+        let byLabel = try rows(try await adapter.previewObject(PreviewRequest(
+            object: table, limit: 3,
+            sort: PreviewRequest.Sort(column: "label", ascending: true))))
+        XCTAssertEqual(byLabel.0.map(\.last!), [.string("item-0001"), .string("item-0002"), .string("item-0003")])
+    }
+
+    func testFilterRoundTrip() async throws {
+        let fixture = try makePagedFixture()
+        let adapter = try fixture.makeAdapter()
+        let table = try await tableObject(adapter)
+
+        // Zero-padded labels: "item-024" matches item-0240…item-0249 only.
+        let filtered = try rows(try await adapter.previewObject(PreviewRequest(
+            object: table, filter: PreviewRequest.Filter(column: "label", contains: "item-024"))))
+        XCTAssertEqual(filtered.0.map(\.first!), [.number(240), .number(241), .number(242),
+                                                  .number(243), .number(244), .number(245), .number(246),
+                                                  .number(247), .number(248), .number(249)])
+
+        // The numeric column is cast to text for the contains match.
+        let byNumber = try rows(try await adapter.previewObject(PreviewRequest(
+            object: table, filter: PreviewRequest.Filter(column: "id", contains: "250"))))
+        XCTAssertEqual(byNumber.0.count, 1)
+        XCTAssertEqual(byNumber.0.first?.first, .number(250))
+
+        // No matches: empty page, columns intact.
+        let none = try await adapter.previewObject(PreviewRequest(
+            object: table, filter: PreviewRequest.Filter(column: "label", contains: "no-such-value")))
+        guard case .rows(let columns, let emptyRows, _) = none else { return XCTFail("expected rows") }
+        XCTAssertEqual(columns.map(\.name), ["id", "label"])
+        XCTAssertTrue(emptyRows.isEmpty)
+    }
+
+    /// LIKE wildcards in the filter text match literally (client-side
+    /// escaping), and the escape character itself matches literally too.
+    func testFilterWildcardsMatchLiterally() async throws {
+        let fixture = try SQLiteFixture().populate([
+            "CREATE TABLE t (v TEXT)",
+            "INSERT INTO t (v) VALUES ('100%'), ('1000'), ('a_b'), ('axb'), ('back\\slash')",
+        ])
+        let adapter = try fixture.makeAdapter()
+        let objects = try await adapter.listObjects()
+        let table = try XCTUnwrap(objects.first { $0.kind == .table })
+
+        let percent = try rows(try await adapter.previewObject(PreviewRequest(
+            object: table, filter: PreviewRequest.Filter(column: "v", contains: "100%"))))
+        XCTAssertEqual(percent.0.map { $0[0] }, [.string("100%")])
+
+        let underscore = try rows(try await adapter.previewObject(PreviewRequest(
+            object: table, filter: PreviewRequest.Filter(column: "v", contains: "a_b"))))
+        XCTAssertEqual(underscore.0.map { $0[0] }, [.string("a_b")])
+
+        let backslash = try rows(try await adapter.previewObject(PreviewRequest(
+            object: table, filter: PreviewRequest.Filter(column: "v", contains: #"back\slash"#))))
+        XCTAssertEqual(backslash.0.map { $0[0] }, [.string(#"back\slash"#)])
+    }
+
+    /// Sort + paging all at once, against a dangerously named column.
+    func testCombinedRequestOnQuotedColumn() async throws {
+        let fixture = try SQLiteFixture().populate([
+            #"CREATE TABLE "odd table" ("we""ird col" INTEGER)"#,
+            #"INSERT INTO "odd table" ("we""ird col") VALUES (1), (2), (3), (4), (5)"#,
+        ])
+        let adapter = try fixture.makeAdapter()
+        let objects = try await adapter.listObjects()
+        let table = try XCTUnwrap(objects.first { $0.kind == .table })
+        XCTAssertEqual(table.name, "odd table")
+
+        let result = try rows(try await adapter.previewObject(PreviewRequest(
+            object: table, offset: 0, limit: 2,
+            sort: PreviewRequest.Sort(column: #"we"ird col"#, ascending: false))))
+        XCTAssertEqual(result.0.map { $0[0] }, [.number(5), .number(4)])
+        XCTAssertTrue(result.1.truncated)
+    }
+
+    /// Previews stay available on read-only connections (the classifier must
+    /// accept the generated SQL).
+    func testPreviewWorksOnReadOnlyConnection() async throws {
+        let fixture = try makePagedFixture()
+        let adapter = try fixture.makeAdapter(readOnly: true)
+        let table = try await tableObject(adapter)
+        let result = try rows(try await adapter.previewObject(PreviewRequest(
+            object: table, offset: 100, limit: 10,
+            sort: PreviewRequest.Sort(column: "label", ascending: true),
+            filter: PreviewRequest.Filter(column: "label", contains: "item-0"))))
+        XCTAssertEqual(result.0.count, 10)
+    }
+}

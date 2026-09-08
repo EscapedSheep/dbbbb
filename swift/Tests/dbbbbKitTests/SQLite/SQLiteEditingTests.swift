@@ -346,4 +346,150 @@ final class SQLiteEditingTests: XCTestCase {
             .sql("SELECT COUNT(*) FROM people"), options: ExecuteOptions()))
         XCTAssertEqual(result.rows.first?.first, .number(1))
     }
+
+    // MARK: - Insert (new row / duplicate row)
+
+    /// Insert round trip: a blank-shaped insert (omitted columns take their
+    /// defaults, including the rowid primary key) and a duplicate-shaped one
+    /// (explicit values minus the primary key) both land, and the generated
+    /// column computes itself.
+    func testInsertAndDuplicateRoundTrip() async throws {
+        let path = try makeDatabase(sql: """
+            CREATE TABLE people (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                score REAL DEFAULT 1.5,
+                note TEXT,
+                upper_name TEXT GENERATED ALWAYS AS (upper(name)) VIRTUAL
+            );
+            INSERT INTO people (id, name, note) VALUES (1, 'before', 'keep');
+            """)
+        let adapter = try makeAdapter(path: path)
+        let table = target(named: "people")
+
+        // Insertable columns exclude the generated column; pk ordinal marks id.
+        let insertable = try await adapter.insertableColumns(for: table)
+        XCTAssertEqual(insertable, [
+            InsertableColumn(name: "id", primaryKeyOrdinal: 1),
+            InsertableColumn(name: "name", primaryKeyOrdinal: 0),
+            InsertableColumn(name: "score", primaryKeyOrdinal: 0),
+            InsertableColumn(name: "note", primaryKeyOrdinal: 0),
+        ])
+
+        // New row: only the required value; id/score/note take defaults.
+        let inserted = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: [:],
+            operation: .insert(values: ["name": .string("new")])))
+        XCTAssertEqual(inserted.meta.count, 1)
+        let afterInsert = try rows(try await adapter.execute(
+            .sql("SELECT id, name, score, note, upper_name FROM people WHERE name = 'new'"),
+            options: ExecuteOptions()))
+        XCTAssertEqual(afterInsert.rows, [[.number(2), .string("new"), .number(1.5), .null, .string("NEW")]])
+
+        // Duplicate of row 1: every editable value prefilled except the
+        // primary key (blank → server default), so no unique-key collision.
+        let duplicate = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: [:],
+            operation: .insert(values: ["name": .string("before"), "note": .string("keep")])))
+        XCTAssertEqual(duplicate.meta.count, 1)
+        let all = try rows(try await adapter.execute(
+            .sql("SELECT id, name, note FROM people ORDER BY id"), options: ExecuteOptions()))
+        XCTAssertEqual(all.rows, [
+            [.number(1), .string("before"), .string("keep")],
+            [.number(2), .string("new"), .null],
+            [.number(3), .string("before"), .string("keep")],
+        ])
+
+        // An explicit primary key is honored; reusing one fails server-side
+        // with a sanitized constraint error.
+        _ = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: [:],
+            operation: .insert(values: ["id": .number(9), "name": .string("explicit")])))
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table,
+                original: [:],
+                operation: .insert(values: ["id": .number(9), "name": .string("collision")])))
+            XCTFail("duplicate primary key must fail")
+        } catch let error as SQLiteAdapterError {
+            XCTAssertFalse(error.userMessage.contains(path), error.userMessage)
+        }
+    }
+
+    /// All-omitted values plan as `DEFAULT VALUES`.
+    func testInsertDefaultValuesRoundTrip() async throws {
+        let path = try makeDatabase(sql: """
+            CREATE TABLE defaults (
+                id INTEGER PRIMARY KEY,
+                label TEXT DEFAULT 'untitled'
+            );
+            """)
+        let adapter = try makeAdapter(path: path)
+        _ = try await adapter.applyDataChange(DataChange(
+            object: target(named: "defaults"),
+            original: [:],
+            operation: .insert(values: [:])))
+        let result = try rows(try await adapter.execute(
+            .sql("SELECT id, label FROM defaults"), options: ExecuteOptions()))
+        XCTAssertEqual(result.rows, [[.number(1), .string("untitled")]])
+    }
+
+    /// Inserts reuse the edit gates: read-only sessions, views, and unknown
+    /// (e.g. generated) columns are all refused.
+    func testInsertFailsClosed() async throws {
+        let path = try makeDatabase(sql: """
+            CREATE TABLE people (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                upper_name TEXT GENERATED ALWAYS AS (upper(name)) VIRTUAL
+            );
+            CREATE VIEW people_view AS SELECT id, name FROM people;
+            """)
+        let adapter = try makeAdapter(path: path)
+
+        // Generated column as an insert target: unknown field, fail closed.
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: target(named: "people"),
+                original: [:],
+                operation: .insert(values: ["name": .string("x"), "upper_name": .string("X")])))
+            XCTFail("generated columns must be refused")
+        } catch let error as SQLiteChangePlanError {
+            XCTAssertTrue(error.userMessage.contains("unknown table field"), error.userMessage)
+        }
+
+        // Views are refused by object kind before any SQL runs.
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: target(named: "people_view", kind: .view),
+                original: [:],
+                operation: .insert(values: ["name": .string("x")])))
+            XCTFail("views must be refused")
+        } catch let error as AdapterError {
+            guard case .notFound = error else {
+                return XCTFail("expected notFound, got \(error)")
+            }
+        }
+
+        let readOnlyAdapter = try makeAdapter(path: path, readOnly: true)
+        do {
+            _ = try await readOnlyAdapter.applyDataChange(DataChange(
+                object: target(named: "people"),
+                original: [:],
+                operation: .insert(values: ["name": .string("x")])))
+            XCTFail("read-only session must refuse inserts")
+        } catch let error as SQLiteAdapterError {
+            XCTAssertTrue(error.userMessage.contains("read-only"), error.userMessage)
+        }
+        // Reading insertable columns is a read: allowed on read-only sessions.
+        let insertable = try await readOnlyAdapter.insertableColumns(for: target(named: "people"))
+        XCTAssertEqual(insertable.map(\.name), ["id", "name"])
+
+        let result = try rows(try await adapter.execute(
+            .sql("SELECT COUNT(*) FROM people"), options: ExecuteOptions()))
+        XCTAssertEqual(result.rows.first?.first, .number(0))
+    }
 }

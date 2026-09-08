@@ -229,4 +229,16 @@ enum MongoChangePlanner {
         }
         return entries.map { ($0.field, originalCondition($0.value)) }
     }
+
+    /// Plans one document insert: the reviewed field/value pairs converted to
+    /// BSON through the canonical EJSON codec, with the same field-name
+    /// validation as updates. `_id` may be given explicitly (tagged EJSON
+    /// shapes like `$oid` keep their BSON type); when it is absent the server
+    /// generates an ObjectId. An empty document is valid.
+    static func planInsert(
+        _ record: [String: DisplayValue]
+    ) throws -> [(key: String, value: BSONValue)] {
+        try documentEntries(record, label: "MongoDB inserted document")
+            .map { (key: $0.field, value: $0.value) }
+    }
 }

@@ -254,4 +254,60 @@ final class SQLiteChangePlannerTests: XCTestCase {
             ("b", "integer", 3),
         ]))
     }
+
+    // MARK: - planInsert
+
+    func testInsertIsParameterizedInEntryOrder() throws {
+        let plan = try SQLiteChangePlanner.planInsert(
+            table: "order\"line",
+            entries: [("status", .string("draft")), ("note", .null), ("qty", .number(4))])
+
+        XCTAssertEqual(plan.text, [
+            "INSERT INTO \"order\"\"line\" (\"status\", \"note\", \"qty\")",
+            "VALUES (?, ?, ?)",
+        ].joined(separator: "\n"))
+        XCTAssertEqual(plan.values, [.string("draft"), .null, .number(4)])
+    }
+
+    func testInsertWithNoEntriesUsesDefaultValues() throws {
+        let plan = try SQLiteChangePlanner.planInsert(table: "t", entries: [])
+        XCTAssertEqual(plan.text, "INSERT INTO \"t\" DEFAULT VALUES")
+        XCTAssertEqual(plan.values, [])
+    }
+
+    func testInsertRejectsDangerousDuplicateAndInvalidFieldNames() {
+        assertPlanThrows(containing: "dangerous key") {
+            try SQLiteChangePlanner.planInsert(
+                table: "t", entries: [("__proto__", .number(1))])
+        }
+        assertPlanThrows(containing: "duplicate field name") {
+            try SQLiteChangePlanner.planInsert(
+                table: "t", entries: [("a", .number(1)), ("a", .number(2))])
+        }
+        assertPlanThrows(containing: "invalid field name") {
+            try SQLiteChangePlanner.planInsert(
+                table: "t", entries: [("a\0b", .number(1))])
+        }
+    }
+
+    /// Insert values are catalog-ordered and unknown columns rejected by the
+    /// same mapper as edits — generated/hidden columns (excluded from the
+    /// metadata) can never be targeted.
+    func testInsertValuesReuseTheEditMappingRules() throws {
+        let metadata = try SQLiteChangePlanner.changeTableMetadata(rows: [
+            ("id", "INTEGER", 1),
+            ("note", "TEXT", 0),
+        ])
+        let entries = try SQLiteChangeMapper.orderedEntries(
+            ["note": .string("x"), "id": .number(7)],
+            metadata: metadata,
+            label: "SQLite insert values")
+        XCTAssertEqual(entries.map(\.column), ["id", "note"])
+
+        XCTAssertThrowsError(try SQLiteChangeMapper.orderedEntries(
+            ["generated_col": .number(1)],
+            metadata: metadata,
+            label: "SQLite insert values"
+        ))
+    }
 }

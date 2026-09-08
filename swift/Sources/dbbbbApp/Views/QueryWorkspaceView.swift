@@ -64,6 +64,13 @@ struct QueryWorkspaceView: View {
                     .help("Cancel the running query (⌘.)")
                 } else {
                     Button {
+                        store.explainCurrentQuery()
+                    } label: {
+                        Label("Explain", systemImage: "doc.text.magnifyingglass")
+                    }
+                    .disabled(!store.canExplainQuery)
+                    .help("Explain the current query (query plan, never executes it)")
+                    Button {
                         store.runQuery()
                     } label: {
                         Label("Run", systemImage: "play.fill")

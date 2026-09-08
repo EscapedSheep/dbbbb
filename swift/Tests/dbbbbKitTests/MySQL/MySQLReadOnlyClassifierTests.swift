@@ -195,4 +195,18 @@ final class MySQLReadOnlyClassifierTests: XCTestCase {
         )
         XCTAssertEqual(tokens, ["SELECT", "FROM", "T", "WHERE", "X"])
     }
+
+    // MARK: - EXPLAIN viewer regression (ROADMAP M2 ⑧)
+
+    /// The Explain feature relies on the classifier allowing EXPLAIN; the
+    /// ANALYZE token (EXPLAIN ANALYZE executes the statement on MySQL 8.0.18+)
+    /// must stay rejected.
+    func testExplainAllowedButAnalyzeStaysRejected() {
+        XCTAssertNoThrow(try MySQLReadOnlyClassifier.assertReadOnly("EXPLAIN SELECT 1"))
+        XCTAssertNoThrow(try MySQLReadOnlyClassifier.assertReadOnly("EXPLAIN FORMAT=JSON SELECT 1"))
+        XCTAssertThrowsError(try MySQLReadOnlyClassifier.assertReadOnly("EXPLAIN ANALYZE SELECT 1")) { error in
+            XCTAssertEqual(error as? MySQLAdapterError, .forbiddenToken("ANALYZE"))
+        }
+        XCTAssertNoThrow(try MySQLReadOnlyClassifier.assertReadOnly("SELECT 'analyze me'"))
+    }
 }

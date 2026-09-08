@@ -173,6 +173,84 @@ public enum DatabaseObjectKind: String, Codable, Sendable {
     case database, schema, table, view, collection
 }
 
+/// One foreign key of a table: the constrained columns, the referenced
+/// object, and the referenced columns in the same ordinal order. Multi-column
+/// keys pair `columns[i]` with `referencedColumns[i]`. `referencedObject.id`
+/// uses the same adapter-generated handle shape `listObjects` emits, so it
+/// can be previewed directly (ROADMAP M1 ⑤).
+public struct ForeignKey: Sendable, Equatable {
+    public let columns: [String]
+    public let referencedObject: DatabaseObject
+    public let referencedColumns: [String]
+    public init(columns: [String], referencedObject: DatabaseObject, referencedColumns: [String]) {
+        self.columns = columns
+        self.referencedObject = referencedObject
+        self.referencedColumns = referencedColumns
+    }
+}
+
+/// One column of a table's structured schema ("View Schema"). `dataType` is
+/// the engine's display type name (PostgreSQL `format_type`, MySQL
+/// `COLUMN_TYPE`, SQLite's declared type — possibly empty).
+public struct ColumnSchema: Sendable, Equatable {
+    public let name: String
+    public let dataType: String
+    public let nullable: Bool
+    /// The 1-based position within the primary key; 0 when the column is not
+    /// part of it (same convention as `InsertableColumn.primaryKeyOrdinal`).
+    public let primaryKeyOrdinal: Int
+    public init(name: String, dataType: String, nullable: Bool, primaryKeyOrdinal: Int) {
+        self.name = name
+        self.dataType = dataType
+        self.nullable = nullable
+        self.primaryKeyOrdinal = primaryKeyOrdinal
+    }
+
+    public var isPrimaryKey: Bool { primaryKeyOrdinal > 0 }
+}
+
+/// One index of a table's structured schema. Expression indexes carry only
+/// their plain columns (engines that cannot enumerate the expression report
+/// the index without them).
+public struct IndexSchema: Sendable, Equatable {
+    public let name: String
+    public let columns: [String]
+    public let isUnique: Bool
+    public init(name: String, columns: [String], isUnique: Bool) {
+        self.name = name
+        self.columns = columns
+        self.isUnique = isUnique
+    }
+}
+
+/// The structured schema of one table: its columns (with nullability and
+/// primary-key positions), foreign keys, and indexes. The viewer counterpart
+/// of the DDL text `SupportsIntrospection` reconstructs.
+public struct TableSchema: Sendable, Equatable {
+    public let object: DatabaseObject
+    public let columns: [ColumnSchema]
+    public let foreignKeys: [ForeignKey]
+    public let indexes: [IndexSchema]
+    public init(object: DatabaseObject, columns: [ColumnSchema], foreignKeys: [ForeignKey], indexes: [IndexSchema]) {
+        self.object = object
+        self.columns = columns
+        self.foreignKeys = foreignKeys
+        self.indexes = indexes
+    }
+}
+
+/// One foreign-key edge of a whole-database relationship overview: the table
+/// holding the constraint plus the foreign key itself (`columns[i]` of
+/// `object` references `referencedColumns[i]` of `referencedObject`).
+public struct TableRelation: Sendable, Equatable {
+    public let object: DatabaseObject
+    public let foreignKey: ForeignKey
+    public init(object: DatabaseObject, foreignKey: ForeignKey) {
+        self.object = object
+        self.foreignKey = foreignKey
+    }
+}
+
 /// A node in the object navigator. `id` is an opaque, adapter-generated handle.
 public struct DatabaseObject: Identifiable, Codable, Sendable, Hashable {
     public let id: String
@@ -272,6 +350,90 @@ extension DisplayValue {
             try c.encode("object", forKey: .kind)
             try c.encode(pairs.map { ["k": DisplayValue.string($0.key), "v": $0.value] }, forKey: .pairs)
         }
+    }
+}
+
+/// Snapshot of one object's storage/row statistics (ROADMAP M2 ⑩). Every
+/// field is optional: engines report only what they know — a never-analyzed
+/// PostgreSQL table has no row estimate, a SQLite view has no sizes, and
+/// MongoDB's uncompressed data size arrives as an extra.
+public struct TableStatistics: Sendable, Equatable {
+    /// One engine-specific extra fact, shown as-is in the statistics sheet.
+    public struct Entry: Sendable, Equatable {
+        public let name: String
+        public let value: String
+        public init(name: String, value: String) {
+            self.name = name; self.value = value
+        }
+    }
+
+    /// Row count: exact for SQLite (`COUNT(*)`) and MongoDB (`collStats`),
+    /// the planner's estimate for PostgreSQL/MySQL. Nil when unknown.
+    public let estimatedRows: Int64?
+    /// Total on-disk bytes including indexes where the engine reports them
+    /// together (PostgreSQL `pg_total_relation_size`, MongoDB `storageSize`).
+    public let totalBytes: Int64?
+    /// Bytes used by indexes alone; nil when the engine does not split them out.
+    public let indexBytes: Int64?
+    public let extras: [Entry]
+
+    public init(
+        estimatedRows: Int64? = nil,
+        totalBytes: Int64? = nil,
+        indexBytes: Int64? = nil,
+        extras: [Entry] = []
+    ) {
+        self.estimatedRows = estimatedRows
+        self.totalBytes = totalBytes
+        self.indexBytes = indexBytes
+        self.extras = extras
+    }
+}
+
+/// One in-flight server-side operation (ROADMAP M2 ⑨): a row in the activity
+/// viewer. Only `id` is guaranteed — engines report what they know, and every
+/// other field is optional (an idle backend has no age, an unauthenticated
+/// MongoDB deployment reports no user).
+public struct ServerActivity: Sendable, Equatable, Identifiable {
+    /// The adapter-defined kill handle, passed verbatim to
+    /// `SupportsServerActivity.killActivity(id:)`: PostgreSQL backend pid,
+    /// MySQL thread id, MongoDB opid (integer as decimal text, or the
+    /// sharded "shard:opid" form).
+    public let id: String
+    public let user: String?
+    public let database: String?
+    /// Statement/command excerpt, truncated by the adapters to
+    /// `statementLimit` characters.
+    public let statement: String?
+    /// How long the operation has been running; nil for idle/unknown.
+    public let age: Duration?
+    public let state: String?
+
+    /// The shared excerpt budget ("a few hundred characters") every engine
+    /// and the demo adapter truncate statements to.
+    public static let statementLimit = 300
+
+    public init(
+        id: String,
+        user: String? = nil,
+        database: String? = nil,
+        statement: String? = nil,
+        age: Duration? = nil,
+        state: String? = nil
+    ) {
+        self.id = id
+        self.user = user
+        self.database = database
+        self.statement = statement
+        self.age = age
+        self.state = state
+    }
+
+    /// Truncates an over-long statement to `limit` characters plus an
+    /// ellipsis marker; shorter statements pass through verbatim.
+    public static func truncatedStatement(_ statement: String, limit: Int = statementLimit) -> String {
+        guard statement.count > limit else { return statement }
+        return String(statement.prefix(limit)) + "…"
     }
 }
 

@@ -75,6 +75,19 @@ final class SessionStore {
     /// Editing is offered only for previews — ad-hoc results have no known
     /// single change target.
     private(set) var previewedObject: DatabaseObject?
+    /// Paging/sort/filter state of the visible preview (ROADMAP M1 ①②).
+    /// Zeroed when the object, connection, or object list is refreshed; an
+    /// edit- or import-triggered re-preview keeps the current page.
+    private(set) var previewOffset = 0
+    private(set) var previewSort: PreviewRequest.Sort?
+    private(set) var previewFilter: PreviewRequest.Filter?
+    /// Exact-match predicates set by a foreign-key jump (ROADMAP M1 ⑤);
+    /// carried on every page turn until the object changes.
+    private(set) var previewEqualities: [PreviewRequest.Equality] = []
+    /// Foreign keys of the previewed object, fetched after each successful
+    /// preview when the adapter conforms to `SupportsForeignKeys`; empty for
+    /// ad-hoc results and non-conforming adapters (fail closed).
+    private(set) var previewedForeignKeys: [ForeignKey] = []
     private(set) var isLoadingObjects = false
     var queryText = ""
     /// Find vs. aggregate for MongoDB connections; the editor text is the
@@ -149,13 +162,35 @@ final class SessionStore {
         objects = []
         selectedObject = nil
         previewedObject = nil
+        previewOffset = 0
+        previewSort = nil
+        previewFilter = nil
+        previewEqualities = []
+        previewedForeignKeys = []
         result = nil
         errorMessage = nil
         queryText = ""
         mongoQueryMode = .find
+        createStatement = nil
+        tableStatistics = nil
+        serverActivity = nil
+        isLoadingActivity = false
+        schemaPresentation = nil
+        isLoadingSchema = false
     }
 
+    /// Refresh zeroes the browsing state (new data may shift page contents)
+    /// and reloads the visible preview from page one; the object list reload
+    /// runs independently.
     func refreshObjects() {
+        previewOffset = 0
+        previewSort = nil
+        previewFilter = nil
+        previewEqualities = []
+        previewedForeignKeys = []
+        if let object = previewedObject {
+            loadPreview(object)
+        }
         loadObjects()
     }
 
@@ -167,18 +202,79 @@ final class SessionStore {
     /// successful connection is persisted (manifest + Keychain secret) so it
     /// survives a restart.
     func addConnection(_ input: ConnectionInput) async throws {
-        let adapter = try await makeAdapter(input)
-        do {
-            _ = try await adapter.listObjects()
-        } catch {
-            await adapter.close()
-            throw error
+        let makeAdapter = self.makeAdapter
+        let adapter = try await probeWithTimeout {
+            let adapter = try await makeAdapter(input)
+            do {
+                _ = try await adapter.listObjects()
+            } catch {
+                await adapter.close()
+                throw error
+            }
+            return adapter
+        } onAbandoned: { adapter in
+            // The probe timed out but the connect eventually finished; nobody
+            // owns this adapter, so close it instead of leaking the session.
+            Task { await adapter.close() }
         }
         let session = Session(profile: adapter.profile, adapter: adapter)
         sessions.append(session)
         selectConnection(session.id)
         // After selectConnection, which clears the error banner.
         persist(input, id: session.id)
+    }
+
+    /// Per-instance so tests can shorten the budget without cross-test bleed.
+    var connectProbeTimeout: Duration = .seconds(15)
+
+    /// Raised when the connect probe exceeds `connectProbeTimeout`. Pre-redacted.
+    struct ConnectProbeTimeoutError: dbbbbError, Equatable {
+        var userMessage: String { "Could not connect: the server did not respond in time." }
+    }
+
+    /// Exactly-one gate for the probe timeout race: the first claimant wins
+    /// and resumes the continuation; the loser cleans up. Mutex-backed.
+    private final class ProbeResumeGate: @unchecked Sendable {
+        private let claimed = Mutex(false)
+
+        func claim() -> Bool {
+            claimed.withLock { flag in
+                if flag { return false }
+                flag = true
+                return true
+            }
+        }
+    }
+
+    /// Races the probe against `connectProbeTimeout` without ever awaiting the
+    /// loser — adapter internals may sit on NIO futures that ignore task
+    /// cancellation, so awaiting them after cancel() could hang the Add sheet
+    /// indefinitely. Exactly one side resumes; a probe that finishes after the
+    /// timeout is handed to `onAbandoned`.
+    private func probeWithTimeout<T: Sendable>(
+        _ probe: @escaping @Sendable () async throws -> T,
+        onAbandoned: (@Sendable (T) -> Void)? = nil
+    ) async throws -> T {
+        let probeTask = Task { try await probe() }
+        let gate = ProbeResumeGate()
+        let timeout = connectProbeTimeout
+        return try await withCheckedThrowingContinuation { continuation in
+            Task {
+                let result = await probeTask.result
+                if gate.claim() {
+                    continuation.resume(with: result)
+                } else if case .success(let value) = result {
+                    onAbandoned?(value)
+                }
+            }
+            Task {
+                try? await Task.sleep(for: timeout)
+                if gate.claim() {
+                    probeTask.cancel()
+                    continuation.resume(throwing: ConnectProbeTimeoutError())
+                }
+            }
+        }
     }
 
     /// Persist after a successful connect. A persistence failure keeps the
@@ -262,6 +358,10 @@ final class SessionStore {
         if engine == .mongodb {
             return "{ }"
         }
+        if let firstLeaf,
+           let statement = try? SelectStatementBuilder.selectLimit100(engine: engine, object: firstLeaf) {
+            return statement
+        }
         return firstLeaf.map { "select * from \($0.name) limit 100;" } ?? "select 1;"
     }
 
@@ -274,8 +374,32 @@ final class SessionStore {
             mongoQueryMode = .find
             queryText = "{ }"
         } else {
-            queryText = "select * from \(object.name) limit 100;"
+            queryText = Self.selectStatement(for: object, engine: session.profile.engine)
         }
+    }
+
+    /// Double-click on a leaf: load its SELECT into the editor and run it
+    /// immediately. SQL text comes from `SelectStatementBuilder` (the same
+    /// identifier quoting as previews); a MongoDB collection runs the find
+    /// template against it.
+    func runSelectLimit100(for object: DatabaseObject) {
+        guard let session = selectedSession, !isExecuting else { return }
+        if session.profile.engine == .mongodb {
+            guard object.kind == .collection else { return }
+        } else {
+            guard object.kind == .table || object.kind == .view else { return }
+        }
+        insertQueryTemplate(for: object)
+        runQuery()
+    }
+
+    /// The select-limit-100 template for one object, quoted like previews;
+    /// undecodable handles fall back to the plain interpolation.
+    private static func selectStatement(for object: DatabaseObject, engine: DatabaseEngine) -> String {
+        if let statement = try? SelectStatementBuilder.selectLimit100(engine: engine, object: object) {
+            return statement
+        }
+        return "select * from \(object.name) limit 100;"
     }
 
     /// Switches the MongoDB editor between find and aggregate. Mirroring the
@@ -301,29 +425,171 @@ final class SessionStore {
     /// identical to the Electron reference.
     static let defaultPipeline = "[\n  { \"$match\": {} }\n]"
 
+    // MARK: Preview browsing (paging / sort / filter)
+
+    /// One page of rows/documents per preview fetch.
+    static let previewPageSize = PreviewRequest.defaultLimit
+
+    /// Zero-based page index of the visible preview.
+    var previewPageIndex: Int { previewOffset / Self.previewPageSize }
+    /// Page-turn affordances for the status bar.
+    var previewHasPreviousPage: Bool { previewedObject != nil && previewOffset > 0 }
+    /// The adapters fetch page size + 1 rows, so a truncated preview result
+    /// means a next page exists (byte-budget truncation is conflated here —
+    /// a page of 100 rows almost never reaches it).
+    var previewHasNextPage: Bool {
+        previewedObject != nil && (result?.meta.truncated ?? false)
+    }
+
     func preview(_ object: DatabaseObject) {
+        guard selectedSession != nil, !isExecuting else { return }
+        // Switching objects zeroes the browsing state.
+        previewOffset = 0
+        previewSort = nil
+        previewFilter = nil
+        previewEqualities = []
+        previewedForeignKeys = []
+        loadPreview(object)
+    }
+
+    func nextPreviewPage() {
+        guard let object = previewedObject, previewHasNextPage, !isExecuting else { return }
+        previewOffset += Self.previewPageSize
+        loadPreview(object)
+    }
+
+    func previousPreviewPage() {
+        guard let object = previewedObject, previewOffset > 0, !isExecuting else { return }
+        previewOffset = max(0, previewOffset - Self.previewPageSize)
+        loadPreview(object)
+    }
+
+    /// Sort changes restart from page one.
+    func setPreviewSort(_ sort: PreviewRequest.Sort?) {
+        guard let object = previewedObject, !isExecuting, previewSort != sort else { return }
+        previewSort = sort
+        previewOffset = 0
+        loadPreview(object)
+    }
+
+    /// Filter changes restart from page one; empty filter text clears.
+    func setPreviewFilter(_ filter: PreviewRequest.Filter?) {
+        let normalized = filter.flatMap { $0.contains.isEmpty ? nil : $0 }
+        guard let object = previewedObject, !isExecuting, previewFilter != normalized else { return }
+        previewFilter = normalized
+        previewOffset = 0
+        loadPreview(object)
+    }
+
+    /// The request for the current browsing state; the request id is the one
+    /// registered with `activeRequestID`, so Cancel interrupts page loads too.
+    private func currentPreviewRequest(for object: DatabaseObject, requestID: UUID = UUID()) -> PreviewRequest {
+        PreviewRequest(
+            object: object,
+            offset: previewOffset,
+            limit: Self.previewPageSize,
+            sort: previewSort,
+            filter: previewFilter,
+            equalities: previewEqualities,
+            requestID: requestID)
+    }
+
+    // MARK: Foreign-key jumps (ROADMAP M1 ⑤)
+
+    /// The FK jumps the selected row can follow: the visible result is a
+    /// preview of one table whose adapter opted into `SupportsForeignKeys`,
+    /// the referenced object is previewable, and every FK column is present
+    /// in the row and non-NULL (a NULL or missing leg can never match, so the
+    /// menu hides the entry instead of offering a jump that finds nothing).
+    func foreignKeyJumps(forRow row: [(key: String, value: DisplayValue)]) -> [ForeignKey] {
+        guard let session = selectedSession,
+              previewedObject != nil,
+              session.adapter is any SupportsForeignKeys
+        else { return [] }
+        return previewedForeignKeys.filter { foreignKey in
+            (foreignKey.referencedObject.kind == .table || foreignKey.referencedObject.kind == .view)
+                && Self.equalityFilters(for: foreignKey, row: row) != nil
+        }
+    }
+
+    /// The equality predicates one jump needs: each referenced column matched
+    /// against the row's value of the paired FK column; nil when any leg is
+    /// missing or NULL.
+    static func equalityFilters(
+        for foreignKey: ForeignKey,
+        row: [(key: String, value: DisplayValue)]
+    ) -> [PreviewRequest.Equality]? {
+        let rowValues = Dictionary(row.map { ($0.key, $0.value) }) { first, _ in first }
+        var equalities: [PreviewRequest.Equality] = []
+        for (column, referencedColumn) in zip(foreignKey.columns, foreignKey.referencedColumns) {
+            guard let value = rowValues[column], value != .null else { return nil }
+            equalities.append(PreviewRequest.Equality(column: referencedColumn, value: value))
+        }
+        return equalities.isEmpty ? nil : equalities
+    }
+
+    /// Follows one foreign key from the selected row: the referenced object
+    /// opens as a fresh preview (page one, no sort/grid filter, same page
+    /// size) filtered to exactly the referenced row(s). Fails closed — a jump
+    /// the menu never offered (stale row, non-previewable target) is refused
+    /// silently; adapter errors surface in the redacted banner through the
+    /// normal preview path.
+    func jumpToReferencedRow(_ foreignKey: ForeignKey, row: [(key: String, value: DisplayValue)]) {
+        guard let session = selectedSession, !isExecuting,
+              previewedObject != nil,
+              session.adapter is any SupportsForeignKeys,
+              previewedForeignKeys.contains(foreignKey),
+              foreignKey.referencedObject.kind == .table
+                  || foreignKey.referencedObject.kind == .view,
+              let equalities = Self.equalityFilters(for: foreignKey, row: row)
+        else { return }
+        previewOffset = 0
+        previewSort = nil
+        previewFilter = nil
+        previewEqualities = equalities
+        previewedForeignKeys = []
+        loadPreview(foreignKey.referencedObject)
+    }
+
+    /// Loads the preview of `object` with the current page/sort/filter state.
+    /// Previews register a request ID just like queries, so Cancel works.
+    private func loadPreview(_ object: DatabaseObject) {
         guard let session = selectedSession, !isExecuting else { return }
         let connectionID = session.id
         selectedObject = object
         previewedObject = object
         errorMessage = nil
         isExecuting = true
-        // Previews register a request ID just like queries, so Cancel works.
-        let requestID = ExecuteOptions().requestID
+        let requestID = UUID()
         activeRequestID = requestID
+        let request = currentPreviewRequest(for: object, requestID: requestID)
         let adapter = session.adapter
         executionTask = Task { @MainActor in
             defer { finishExecution(for: requestID) }
             do {
-                let previewed = try await adapter.previewObject(object)
-                // Ignore stale completions after the user switched connections.
+                let previewed = try await adapter.previewObject(request)
+                // Ignore stale completions after the user switched connections
+                // or a newer page load superseded this one.
                 guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
                 result = previewed
+                // FK metadata backs the row context menu's "Jump to
+                // Referenced Row"; a metadata failure degrades to no menu
+                // entries, never a banner — the preview itself succeeded.
+                if let foreignKeyAdapter = adapter as? any SupportsForeignKeys {
+                    let keys = (try? await foreignKeyAdapter.foreignKeys(for: object)) ?? []
+                    guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
+                    previewedForeignKeys = keys
+                } else {
+                    previewedForeignKeys = []
+                }
             } catch {
                 guard activeRequestID == requestID else { return }
                 // The screen still shows the previous data; never leave the
                 // preview pointer aimed at the object that never loaded.
                 previewedObject = nil
+                previewOffset = 0
+                previewEqualities = []
+                previewedForeignKeys = []
                 // Cancelled: keep the previous result, no banner.
                 guard !cancellationRequested, !Self.isCancellation(error) else { return }
                 guard selectedConnectionID == connectionID else { return }
@@ -338,6 +604,8 @@ final class SessionStore {
         let text = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         previewedObject = nil
+        previewEqualities = []
+        previewedForeignKeys = []
         let command: DatabaseCommand
         if session.profile.engine == .mongodb {
             guard let object = selectedObject, object.kind == .collection else {
@@ -353,21 +621,35 @@ final class SessionStore {
         } else {
             command = .sql(text)
         }
+        executeCommand(session: session, record: command) { adapter, options in
+            try await adapter.execute(command, options: options)
+        }
+    }
+
+    /// Shared execution core for ad-hoc queries and EXPLAIN runs (ROADMAP M2
+    /// ⑧): registers the request ID (Cancel and the staleness guards work),
+    /// surfaces redacted errors, and records history only for user queries
+    /// (`record`) — explains are meta-queries and stay out of the history.
+    private func executeCommand(
+        session: Session,
+        record historyCommand: DatabaseCommand?,
+        operation: @escaping @Sendable (any DatabaseAdapter, ExecuteOptions) async throws -> QueryResult
+    ) {
         errorMessage = nil
         isExecuting = true
         let connectionID = session.id
+        let adapter = session.adapter
         let options = ExecuteOptions()
         let requestID = options.requestID
         activeRequestID = requestID
-        let adapter = session.adapter
         executionTask = Task { @MainActor in
             defer { finishExecution(for: requestID) }
             do {
-                let executed = try await adapter.execute(command, options: options)
+                let executed = try await operation(adapter, options)
                 // Ignore stale completions after the user switched connections.
                 guard selectedConnectionID == connectionID, activeRequestID == requestID else { return }
                 result = executed
-                recordQuery(command, session: session)
+                if let historyCommand { recordQuery(historyCommand, session: session) }
             } catch {
                 // Cancelled: keep the previous result, no banner.
                 guard !cancellationRequested, !Self.isCancellation(error) else { return }
@@ -376,6 +658,66 @@ final class SessionStore {
             }
         }
     }
+
+    // MARK: Explain (ROADMAP M2 ⑧)
+
+    /// The Explain affordance: there is query text and, for MongoDB, a
+    /// collection is selected (the same gate as Run).
+    var canExplainQuery: Bool {
+        guard let session = selectedSession, !isExecuting,
+              !queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        if session.profile.engine == .mongodb {
+            return selectedObject?.kind == .collection
+        }
+        return true
+    }
+
+    /// Explains the current editor query. SQL engines run the EXPLAIN form
+    /// of the text (`EXPLAIN QUERY PLAN` on SQLite) through the normal
+    /// execute path — bounds, timeout, cancel, and redacted errors all reuse
+    /// it, and the plan renders as the normal rows grid. MongoDB wraps the
+    /// parsed find/aggregate command as `{explain: …, verbosity:
+    /// "queryPlanner"}` through the adapter's explain capability, respecting
+    /// the current find/aggregate mode; adapters without it fail closed.
+    func explainCurrentQuery() {
+        guard let session = selectedSession, !isExecuting else { return }
+        let text = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        previewedObject = nil
+        previewEqualities = []
+        previewedForeignKeys = []
+        if session.profile.engine == .mongodb {
+            guard let object = selectedObject, object.kind == .collection else {
+                errorMessage = "Select a collection in the object list first — MongoDB queries run against the selected collection."
+                return
+            }
+            guard session.adapter is any SupportsExplain else {
+                errorMessage = "This connection does not support explaining queries."
+                return
+            }
+            let command: DatabaseCommand
+            switch mongoQueryMode {
+            case .find:
+                command = .mongoFind(collection: object.name, filter: text)
+            case .aggregate:
+                command = .mongoAggregate(collection: object.name, pipeline: text)
+            }
+            executeCommand(session: session, record: nil) { adapter, options in
+                guard let explainer = adapter as? any SupportsExplain else {
+                    throw AdapterError.notFound("This connection does not support explaining queries.")
+                }
+                return try await explainer.explain(command, options: options)
+            }
+        } else {
+            guard let statement = ExplainPlanner.statement(engine: session.profile.engine, query: text)
+            else { return }
+            executeCommand(session: session, record: nil) { adapter, options in
+                try await adapter.execute(.sql(statement), options: options)
+            }
+        }
+    }
+
 
     func cancelQuery() {
         guard let requestID = activeRequestID, let session = selectedSession else { return }
@@ -425,10 +767,10 @@ final class SessionStore {
         return object
     }
 
-    /// Applies one reviewed change through the editing capability, then
-    /// re-previews the object so the visible result reflects it. Fails
-    /// closed: any missing precondition becomes a banner error, never a
-    /// write. Returns false (with `errorMessage` set) on failure.
+    /// Applies one reviewed change (update, delete, or insert) through the
+    /// editing capability, then re-previews the object so the visible result
+    /// reflects it. Fails closed: any missing precondition becomes a banner
+    /// error, never a write. Returns false (with `errorMessage` set) on failure.
     @discardableResult
     func applyDataChange(_ change: DataChange) async -> Bool {
         guard let session = selectedSession,
@@ -444,8 +786,10 @@ final class SessionStore {
         defer { isApplyingChange = false }
         do {
             _ = try await adapter.applyDataChange(change)
+            // Re-preview at the same page/sort/filter so the reviewer sees the
+            // change where they made it.
             if let object = previewedObject, selectedConnectionID == connectionID {
-                result = try await adapter.previewObject(object)
+                result = try await adapter.previewObject(currentPreviewRequest(for: object))
             }
             return true
         } catch {
@@ -454,6 +798,96 @@ final class SessionStore {
             errorMessage = Self.redactedMessage(for: error)
             return false
         }
+    }
+
+    // MARK: Record insertion
+
+    /// Insert draft in progress, presented by the status bar's sheet. Set only
+    /// through `beginInsert()` / `beginDuplicate(row:)`, which enforce the
+    /// same fail-closed gates as editing (`editingObject`).
+    var recordEditingState: RecordEditingState?
+
+    /// Opens the blank insert draft for the previewed object. SQL targets
+    /// introspect the insertable columns first (generated columns never
+    /// appear, unknown-column payloads are rejected adapter-side); MongoDB
+    /// opens the canonical EJSON document editor with an empty document.
+    func beginInsert() {
+        guard let object = editingObject, let session = selectedSession else { return }
+        if object.kind == .collection {
+            recordEditingState = .editing(RecordDraft(
+                object: object, environment: session.profile.environment,
+                columns: [], original: [], insertPrefill: []))
+            return
+        }
+        loadInsertDraft(object: object, session: session, row: nil)
+    }
+
+    /// Opens the duplicate draft for one visible preview row: every insertable
+    /// column is prefilled from the row's displayed values, except primary-key
+    /// columns, which stay blank so the server default (serial / rowid /
+    /// auto-increment) applies instead of colliding with the source row's
+    /// unique key.
+    func beginDuplicate(row: [(key: String, value: DisplayValue)]) {
+        guard let object = editingObject, let session = selectedSession else { return }
+        // MongoDB results are documents, never rows; duplicates of documents
+        // go through the blank EJSON draft instead.
+        guard object.kind == .table else { return }
+        loadInsertDraft(object: object, session: session, row: row)
+    }
+
+    /// Shared insert-draft loader: introspects insertable columns, then opens
+    /// the sheet. Introspection failures surface in the redacted banner; the
+    /// sheet simply does not open (fail closed).
+    private func loadInsertDraft(
+        object: DatabaseObject, session: Session, row: [(key: String, value: DisplayValue)]?
+    ) {
+        guard let adapter = session.adapter as? any SupportsEditing else { return }
+        let connectionID = session.id
+        let environment = session.profile.environment
+        Task { @MainActor in
+            do {
+                let insertable = try await adapter.insertableColumns(for: object)
+                guard selectedConnectionID == connectionID else { return }
+                recordEditingState = .editing(makeInsertDraft(
+                    object: object, environment: environment,
+                    insertable: insertable, row: row))
+            } catch {
+                guard !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID else { return }
+                errorMessage = Self.redactedMessage(for: error)
+            }
+        }
+    }
+
+    /// The blank or duplicated insert draft. Seeds: `.null` (NULL toggle on)
+    /// for Add Row; the row's values for Duplicate Row with primary keys
+    /// blanked (see `beginDuplicate`). At review time, fields still NULL are
+    /// *omitted* from the INSERT so the column default applies.
+    private func makeInsertDraft(
+        object: DatabaseObject,
+        environment: ConnectionEnvironment,
+        insertable: [InsertableColumn],
+        row: [(key: String, value: DisplayValue)]?
+    ) -> RecordDraft {
+        let rowValues = Dictionary((row ?? []).map { ($0.key, $0.value) }) { first, _ in first }
+        let prefill: [(key: String, value: DisplayValue)] = insertable.map { column in
+            if column.primaryKeyOrdinal > 0 { return (column.name, .null) }
+            return (column.name, rowValues[column.name] ?? .null)
+        }
+        // Keep the preview's column metadata (numeric alignment) where the
+        // preview showed the column; introspected-only columns get defaults.
+        var previewColumns: [String: ColumnMeta] = [:]
+        if case .rows(let columns, _, _) = result {
+            previewColumns = Dictionary(columns.map { ($0.name, $0) }) { first, _ in first }
+        }
+        return RecordDraft(
+            object: object,
+            environment: environment,
+            columns: insertable.map {
+                previewColumns[$0.name] ?? ColumnMeta(name: $0.name, typeName: "")
+            },
+            original: [],
+            insertPrefill: prefill)
     }
 
     // MARK: - Result export
@@ -468,13 +902,24 @@ final class SessionStore {
         Self.exportBaseName("\(selectedSession?.profile.database ?? "dbbbb")-result")
     }
 
+    /// The qualified target table for INSERT-statement export, when known:
+    /// only previews of one object have a known source table; ad-hoc row
+    /// results and document results (MongoDB stays JSONL-only) do not.
+    var insertExportTable: [String]? {
+        guard let object = previewedObject,
+              let engine = selectedSession?.profile.engine,
+              case .rows = result
+        else { return nil }
+        return InsertStatementRenderer.tableNameParts(engine: engine, object: object)
+    }
+
     /// Serializes the current result and writes it atomically. Errors are
     /// redacted: `ResultExportError` messages are safe by contract, and any
     /// file-system failure collapses to a fixed path-free message.
-    func exportResult(to url: URL) {
+    func exportResult(to url: URL, format: ResultExporter.Format = .automatic) {
         guard let result else { return }
         do {
-            let exported = try ResultExporter.exportData(for: result)
+            let exported = try ResultExporter.exportData(for: result, format: format)
             try AtomicFileWriter.write(exported.data, to: url)
             errorMessage = nil
         } catch let error as dbbbbError {
@@ -572,9 +1017,9 @@ final class SessionStore {
                         }
                     }))
                 importSummary = summary
-                // Refresh the preview so the imported rows are visible.
+                // Refresh the preview (same page) so the imported rows are visible.
                 if let object = previewedObject, selectedConnectionID == session.id {
-                    result = try? await adapter.previewObject(object)
+                    result = try? await adapter.previewObject(currentPreviewRequest(for: object))
                 }
             } catch {
                 importSummary = nil
@@ -587,6 +1032,286 @@ final class SessionStore {
 
     func cancelImport() {
         importCancelFlag.set()
+    }
+
+    // MARK: - Create statement (DDL viewer)
+
+    /// One fetched create statement, presented read-only in a sheet.
+    struct CreateStatementPresentation: Identifiable {
+        let id = UUID()
+        let objectName: String
+        let ddl: String
+    }
+
+    /// Non-nil while the create-statement sheet is shown.
+    private(set) var createStatement: CreateStatementPresentation?
+
+    /// Whether the context menu may offer "View Create Statement" for an
+    /// object. Fail closed: only adapters that opted into
+    /// `SupportsIntrospection` and only table/view objects (MongoDB has no
+    /// DDL to show and never conforms). Read-only profiles may read DDL.
+    func canShowCreateStatement(for object: DatabaseObject) -> Bool {
+        guard let session = selectedSession,
+              session.adapter is any SupportsIntrospection,
+              object.kind == .table || object.kind == .view
+        else { return false }
+        return true
+    }
+
+    /// Fetches the DDL in the background; failures go through the redacted
+    /// banner, never into the sheet.
+    func showCreateStatement(for object: DatabaseObject) {
+        guard canShowCreateStatement(for: object),
+              let session = selectedSession,
+              let adapter = session.adapter as? any SupportsIntrospection
+        else { return }
+        let connectionID = session.id
+        Task { @MainActor in
+            do {
+                let ddl = try await adapter.createStatement(for: object)
+                // Ignore stale completions after the user switched connections.
+                guard selectedConnectionID == connectionID else { return }
+                createStatement = CreateStatementPresentation(objectName: object.name, ddl: ddl)
+            } catch {
+                guard !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID else { return }
+                errorMessage = Self.redactedMessage(for: error)
+            }
+        }
+    }
+
+    func dismissCreateStatement() {
+        createStatement = nil
+    }
+
+    // MARK: - Table statistics (ROADMAP M2 ⑩)
+
+    /// One fetched statistics snapshot, presented read-only in a sheet.
+    struct TableStatisticsPresentation: Identifiable {
+        let id = UUID()
+        let objectName: String
+        let statistics: TableStatistics
+    }
+
+    /// Non-nil while the statistics sheet is shown.
+    private(set) var tableStatistics: TableStatisticsPresentation?
+
+    /// Whether the context menu may offer "Statistics…" for an object. Fail
+    /// closed: only adapters that opted into `SupportsTableStatistics` and
+    /// only table/view/collection objects. Read-only profiles may read stats.
+    func canShowTableStatistics(for object: DatabaseObject) -> Bool {
+        guard let session = selectedSession,
+              session.adapter is any SupportsTableStatistics,
+              object.kind == .table || object.kind == .view || object.kind == .collection
+        else { return false }
+        return true
+    }
+
+    /// Fetches the statistics in the background; failures go through the
+    /// redacted banner, never into the sheet.
+    func showTableStatistics(for object: DatabaseObject) {
+        guard canShowTableStatistics(for: object),
+              let session = selectedSession,
+              let adapter = session.adapter as? any SupportsTableStatistics
+        else { return }
+        let connectionID = session.id
+        Task { @MainActor in
+            do {
+                let statistics = try await adapter.tableStatistics(for: object)
+                // Ignore stale completions after the user switched connections.
+                guard selectedConnectionID == connectionID else { return }
+                tableStatistics = TableStatisticsPresentation(
+                    objectName: object.name, statistics: statistics)
+            } catch {
+                guard !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID else { return }
+                errorMessage = Self.redactedMessage(for: error)
+            }
+        }
+    }
+
+    func dismissTableStatistics() {
+        tableStatistics = nil
+    }
+
+    // MARK: - Schema viewer ("View Schema")
+
+    /// One fetched database schema, presented read-only in a sheet: every
+    /// table's structured schema plus the database-wide relationship list.
+    struct SchemaPresentation: Identifiable {
+        let id = UUID()
+        let databaseName: String
+        var tables: [TableSchema]
+        var relations: [TableRelation]
+    }
+
+    /// Non-nil while the schema sheet is shown.
+    private(set) var schemaPresentation: SchemaPresentation?
+    private(set) var isLoadingSchema = false
+
+    /// Whether the toolbar may offer "Schema…". Fail closed: only adapters
+    /// that opted into `SupportsSchemaIntrospection` (MongoDB never does).
+    /// Reading metadata is a read: read-only profiles may read schemas.
+    var canShowSchema: Bool {
+        selectedSession?.adapter is any SupportsSchemaIntrospection
+    }
+
+    /// Fetches every table's schema plus the database-wide foreign-key edges
+    /// in the background; failures go through the redacted banner, never into
+    /// the sheet (fail closed — the sheet only ever shows complete data).
+    func showSchema() {
+        guard canShowSchema, !isLoadingSchema,
+              let session = selectedSession,
+              let adapter = session.adapter as? any SupportsSchemaIntrospection
+        else { return }
+        let connectionID = session.id
+        let databaseName = session.profile.database
+        let tables = objects.filter { $0.kind == .table }
+        isLoadingSchema = true
+        Task { @MainActor in
+            do {
+                var schemas: [TableSchema] = []
+                for object in tables {
+                    schemas.append(try await adapter.schema(for: object))
+                }
+                let relations = try await adapter.allForeignKeys()
+                // Ignore stale completions after the user switched connections.
+                guard selectedConnectionID == connectionID else {
+                    isLoadingSchema = false
+                    return
+                }
+                schemaPresentation = SchemaPresentation(
+                    databaseName: databaseName, tables: schemas, relations: relations)
+                isLoadingSchema = false
+            } catch {
+                isLoadingSchema = false
+                guard !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID else { return }
+                errorMessage = Self.redactedMessage(for: error)
+            }
+        }
+    }
+
+    func dismissSchema() {
+        schemaPresentation = nil
+    }
+
+    // MARK: - Server activity (ROADMAP M2 ⑨)
+
+    /// One activity snapshot, presented in the sheet; rows refresh in place.
+    struct ServerActivityPresentation: Identifiable {
+        let id = UUID()
+        var activities: [ServerActivity]
+    }
+
+    /// Non-nil while the activity sheet is shown.
+    private(set) var serverActivity: ServerActivityPresentation?
+    private(set) var isLoadingActivity = false
+
+    /// Whether the toolbar may offer "Activity…". Listing is a read: any
+    /// conforming adapter offers it, read-only and demo profiles included;
+    /// non-conforming adapters (SQLite) fail closed and never see the entry.
+    var canShowServerActivity: Bool {
+        selectedSession?.adapter is any SupportsServerActivity
+    }
+
+    /// Kill is the destructive half: writable, real (non-demo) profiles only.
+    var canKillServerActivity: Bool {
+        guard let session = selectedSession,
+              !session.profile.readOnly,
+              !session.profile.demo,
+              session.adapter is any SupportsServerActivity
+        else { return false }
+        return true
+    }
+
+    /// Why the sheet's Kill button stays disabled, when it does; nil when
+    /// killing is available.
+    var killActivityUnavailableReason: String? {
+        guard let session = selectedSession,
+              session.adapter is any SupportsServerActivity
+        else { return "This connection does not support server activity." }
+        if session.profile.demo { return "Demo connections have no real server activity to kill." }
+        if session.profile.readOnly { return "Read-only connections cannot kill server activity." }
+        return nil
+    }
+
+    /// Fetches the activity snapshot and opens the sheet on success; failures
+    /// go through the redacted banner, never into the sheet (fail closed).
+    func showServerActivity() {
+        fetchServerActivity(present: true)
+    }
+
+    /// Re-fetches the rows of the open sheet; a failure keeps the previous
+    /// rows and surfaces the redacted banner.
+    func refreshServerActivity() {
+        guard serverActivity != nil else { return }
+        fetchServerActivity(present: false)
+    }
+
+    func dismissServerActivity() {
+        serverActivity = nil
+    }
+
+    private func fetchServerActivity(present: Bool) {
+        guard let session = selectedSession,
+              let adapter = session.adapter as? any SupportsServerActivity
+        else { return }
+        let connectionID = session.id
+        isLoadingActivity = true
+        Task { @MainActor in
+            do {
+                let activities = try await adapter.listActivity()
+                // Ignore stale completions after the user switched connections.
+                guard selectedConnectionID == connectionID else {
+                    isLoadingActivity = false
+                    return
+                }
+                if present {
+                    serverActivity = ServerActivityPresentation(activities: activities)
+                } else if serverActivity != nil {
+                    serverActivity?.activities = activities
+                }
+                isLoadingActivity = false
+            } catch {
+                isLoadingActivity = false
+                guard !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID else { return }
+                errorMessage = Self.redactedMessage(for: error)
+            }
+        }
+    }
+
+    /// Kills one activity through the capability, then refreshes the list so
+    /// the killed row disappears. Fails closed: any missing precondition
+    /// becomes a banner error; adapter failures surface redacted. Returns
+    /// false (with `errorMessage` set) on failure.
+    @discardableResult
+    func killServerActivity(id: String) async -> Bool {
+        guard canKillServerActivity,
+              let session = selectedSession,
+              let adapter = session.adapter as? any SupportsServerActivity
+        else {
+            errorMessage = killActivityUnavailableReason
+                ?? "This connection does not support killing server activity."
+            return false
+        }
+        let connectionID = session.id
+        do {
+            try await adapter.killActivity(id: id)
+            // Refresh so the sheet reflects the kill; a refresh failure just
+            // keeps the stale row, the kill itself succeeded.
+            if selectedConnectionID == connectionID, serverActivity != nil,
+               let refreshed = try? await adapter.listActivity() {
+                serverActivity?.activities = refreshed
+            }
+            return true
+        } catch {
+            guard !Self.isCancellation(error) else { return false }
+            guard selectedConnectionID == connectionID else { return false }
+            errorMessage = Self.redactedMessage(for: error)
+            return false
+        }
     }
 
     // MARK: Query history

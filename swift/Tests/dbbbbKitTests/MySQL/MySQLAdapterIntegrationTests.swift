@@ -455,6 +455,81 @@ final class MySQLAdapterIntegrationTests: XCTestCase {
                 return XCTFail("expected notFound, got \(error)")
             }
         }
+
+        // Inserts are refused on read-only sessions too.
+        do {
+            _ = try await readOnlyAdapter.applyDataChange(DataChange(
+                object: fakeTable,
+                original: [:],
+                operation: .insert(values: ["note": .string("x")])))
+            XCTFail("read-only session must refuse inserts")
+        } catch let error as MySQLAdapterError {
+            XCTAssertTrue(error.userMessage.contains("read-only"), error.userMessage)
+        }
+    }
+
+    /// Insert round trip (ROADMAP M1 ③): insertable-column introspection
+    /// excludes the generated column, an insert omitting the auto-increment
+    /// primary key takes server defaults (affected-rows == 1 checked
+    /// adapter-side), and a duplicate-shaped insert does not collide.
+    func testApplyDataChangeInsertAndDuplicate() async throws {
+        let adapter = try makeAdapter()
+        _ = try await adapter.execute(.sql("""
+            CREATE TABLE IF NOT EXISTS dbbbb_it_insert (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                note VARCHAR(100),
+                score DECIMAL(12,4) DEFAULT 1.1000,
+                upper_note VARCHAR(100) GENERATED ALWAYS AS (UPPER(note)) VIRTUAL
+            )
+            """), options: ExecuteOptions())
+        _ = try await adapter.execute(.sql(
+            "DELETE FROM dbbbb_it_insert"), options: ExecuteOptions())
+        _ = try await adapter.execute(.sql(
+            "INSERT INTO dbbbb_it_insert (note) VALUES ('before')"), options: ExecuteOptions())
+
+        let table = try await editingTable(adapter, name: "dbbbb_it_insert")
+
+        // The generated column never appears in the draft; the auto-increment
+        // key is marked so the duplicate flow can blank it.
+        let insertable = try await adapter.insertableColumns(for: table)
+        XCTAssertEqual(insertable, [
+            InsertableColumn(name: "id", primaryKeyOrdinal: 1),
+            InsertableColumn(name: "note", primaryKeyOrdinal: 0),
+            InsertableColumn(name: "score", primaryKeyOrdinal: 0),
+        ])
+
+        // New row: defaults fill id and score.
+        let inserted = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: [:],
+            operation: .insert(values: ["note": .string("new")])))
+        XCTAssertEqual(inserted.meta.count, 1)
+
+        // Duplicate of the first row: everything but the primary key.
+        _ = try await adapter.applyDataChange(DataChange(
+            object: table,
+            original: [:],
+            operation: .insert(values: ["note": .string("before"), "score": .string("2.5000")])))
+
+        let (_, all) = try rows(try await adapter.execute(.sql(
+            "SELECT note, score, upper_note FROM dbbbb_it_insert ORDER BY id"),
+            options: ExecuteOptions()))
+        XCTAssertEqual(all, [
+            [.string("before"), .string("1.1000"), .string("BEFORE")],
+            [.string("new"), .string("1.1000"), .string("NEW")],
+            [.string("before"), .string("2.5000"), .string("BEFORE")],
+        ])
+
+        // Unknown fields (e.g. the generated column) fail closed.
+        do {
+            _ = try await adapter.applyDataChange(DataChange(
+                object: table,
+                original: [:],
+                operation: .insert(values: ["upper_note": .string("x")])))
+            XCTFail("generated columns must be refused")
+        } catch let error as MySQLChangePlanError {
+            XCTAssertTrue(error.userMessage.contains("unknown table field"), error.userMessage)
+        }
     }
 
     // MARK: - Import
@@ -537,6 +612,94 @@ final class MySQLAdapterIntegrationTests: XCTestCase {
             XCTAssertEqual(
                 error,
                 .unsupported("MySQL import is disabled for read-only connections."))
+        }
+    }
+}
+
+// MARK: - Database-less (server-wide) connections & create statements
+
+extension MySQLAdapterIntegrationTests {
+    /// Same URL parsing as `makeInput`, but with an empty database: the
+    /// session starts without a default schema.
+    private func makeServerWideAdapter() throws -> MySQLAdapter {
+        guard let urlString = ProcessInfo.processInfo.environment["DBBBB_TEST_MYSQL_URL"],
+              let url = URL(string: urlString),
+              let host = url.host
+        else {
+            throw XCTSkip("DBBBB_TEST_MYSQL_URL is not set")
+        }
+        let adapter = try MySQLAdapter(input: .init(
+            name: "integration-serverwide",
+            host: host,
+            port: url.port ?? 3306,
+            username: url.user ?? "root",
+            password: url.password ?? "",
+            database: "",
+            sslMode: .disable
+        ))
+        addTeardownBlock {
+            await adapter.close()
+        }
+        return adapter
+    }
+
+    func testServerWideListObjectsGroupsNonSystemSchemas() async throws {
+        let adapter = try makeServerWideAdapter()
+        let objects = try await adapter.listObjects()
+        let roots = objects.filter { $0.parentID == nil }
+        XCTAssertFalse(roots.isEmpty)
+        XCTAssertTrue(roots.allSatisfy { $0.kind == .database })
+        guard let testRoot = roots.first(where: { $0.name == "dbbbb_test" }) else {
+            return XCTFail("dbbbb_test missing from the server-wide tree")
+        }
+        for system in ["mysql", "sys", "information_schema", "performance_schema"] {
+            XCTAssertFalse(roots.contains(where: { $0.name == system }), "\(system) must be excluded")
+        }
+        let children = objects.filter { $0.parentID == testRoot.id }
+        XCTAssertTrue(children.contains(where: { $0.kind == .table && $0.name == "dbbbb_it_seed" }))
+        XCTAssertTrue(children.contains(where: { $0.kind == .view && $0.name == "dbbbb_it_seed_view" }))
+    }
+
+    /// Without a default schema, preview and DDL still resolve through the
+    /// child ref's own schema qualification.
+    func testServerWidePreviewAndCreateStatementStayQualified() async throws {
+        let adapter = try makeServerWideAdapter()
+        let objects = try await adapter.listObjects()
+        guard let table = objects.first(where: { $0.kind == .table && $0.name == "dbbbb_it_seed" }),
+              let view = objects.first(where: { $0.kind == .view && $0.name == "dbbbb_it_seed_view" })
+        else {
+            throw XCTSkip("seed objects missing")
+        }
+
+        let result = try await adapter.previewObject(table)
+        guard case .rows(_, let rows, _) = result else {
+            return XCTFail("expected rows result")
+        }
+        XCTAssertEqual(rows.count, 2)
+
+        let tableDDL = try await adapter.createStatement(for: table)
+        XCTAssertTrue(tableDDL.contains("CREATE TABLE `dbbbb_it_seed`"))
+        let viewDDL = try await adapter.createStatement(for: view)
+        XCTAssertTrue(viewDDL.contains("VIEW"))
+        XCTAssertTrue(viewDDL.contains("dbbbb_it_seed"))
+    }
+
+    func testCreateStatementOnDefaultSchemaConnection() async throws {
+        let adapter = try makeAdapter()
+        let objects = try await adapter.listObjects()
+        guard let table = objects.first(where: { $0.kind == .table }) else {
+            throw XCTSkip("no tables in the test database")
+        }
+        let ddl = try await adapter.createStatement(for: table)
+        XCTAssertTrue(ddl.contains("CREATE TABLE"))
+        // The database parent node is not a valid introspection target.
+        do {
+            _ = try await adapter.createStatement(for: objects[0])
+            XCTFail("database nodes must fail closed")
+        } catch let error as AdapterError {
+            guard case .notFound = error else {
+                return XCTFail("wrong error: \(error)")
+            }
         }
     }
 }

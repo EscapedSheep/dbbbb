@@ -33,4 +33,16 @@ struct ModelTests {
         #expect(ConnectionInput.redactMongoURI("mongodb://host:27017/db") == "mongodb://host:27017/db")
         #expect(ConnectionInput.redactMongoURI("not-a-uri") == "not-a-uri")
     }
+
+    /// The FK contract (ROADMAP M1 ⑤): value semantics, and the referenced
+    /// object rides along as a plain navigator node.
+    @Test func foreignKeyContract() {
+        let target = DatabaseObject(id: "sqlite:users", parentID: nil, name: "users", kind: .table)
+        let key = ForeignKey(columns: ["org", "no"], referencedObject: target, referencedColumns: ["org_id", "order_no"])
+        #expect(key.columns == ["org", "no"])
+        #expect(key.referencedColumns == ["org_id", "order_no"])
+        #expect(key.referencedObject == target)
+        #expect(key == ForeignKey(columns: ["org", "no"], referencedObject: target, referencedColumns: ["org_id", "order_no"]))
+        #expect(key != ForeignKey(columns: ["org"], referencedObject: target, referencedColumns: ["org_id"]))
+    }
 }

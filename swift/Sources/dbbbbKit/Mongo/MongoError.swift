@@ -9,6 +9,8 @@ enum MongoAdapterError: dbbbbError, Equatable {
     case invalidExtendedJSON(String)
     case writeStageRejected(String)
     case noCollectionSelected
+    case invalidPreviewField
+    case previewEqualityUnsupported
     case duplicateRequest
     case cancelled
     case timedOut
@@ -22,6 +24,8 @@ enum MongoAdapterError: dbbbbError, Equatable {
         case .invalidExtendedJSON(let detail): detail
         case .writeStageRejected(let stage): "\(stage) is disabled because it writes data."
         case .noCollectionSelected: "Select a collection before running MongoDB queries."
+        case .invalidPreviewField: "MongoDB previews cannot sort or filter on that field name."
+        case .previewEqualityUnsupported: "MongoDB has no foreign keys; equality-filtered previews are unsupported."
         case .duplicateRequest: "A MongoDB query with this request id is already running."
         case .cancelled: "MongoDB query cancelled."
         case .timedOut: "MongoDB query timed out."

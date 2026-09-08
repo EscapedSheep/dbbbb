@@ -76,10 +76,19 @@ public final class MongoAdapter: DatabaseAdapter, Sendable {
 
     private let state: Mutex<State>
 
-    private static let previewLimit = 100
     private static let writeStages: Set<String> = ["$out", "$merge"]
 
     public init(input: ConnectionInput.MongoInput) async throws {
+        // Empty-database browsing is deliberately unsupported: the command
+        // contract (`.mongoFind(collection:)` / `.mongoAggregate(collection:)`)
+        // carries no database, and every command runs `$cmd` against this one
+        // fixed database. Routing different databases through the collection
+        // field would silently regress that contract, so a database is
+        // required here at the boundary (the connection form validates too).
+        let database = input.database.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !database.isEmpty else {
+            throw MongoAdapterError.invalidConfiguration("MongoDB connections require a database.")
+        }
         let uri = try Self.effectiveURI(input: input)
         let settings: ConnectionSettings
         do {
@@ -96,7 +105,7 @@ public final class MongoAdapter: DatabaseAdapter, Sendable {
         }
 
         self.cluster = cluster
-        self.databaseName = input.database
+        self.databaseName = database
         self.state = Mutex(State())
         self.profile = ConnectionProfile(
             name: input.name,
@@ -132,21 +141,40 @@ public final class MongoAdapter: DatabaseAdapter, Sendable {
         }
     }
 
-    public func previewObject(_ object: DatabaseObject) async throws -> QueryResult {
+    public func previewObject(_ request: PreviewRequest) async throws -> QueryResult {
         try assertOpen()
-        guard object.kind == .collection else {
+        guard request.object.kind == .collection else {
             throw AdapterError.notFound("This MongoDB object cannot be previewed.")
         }
-        let collection = try Self.collectionName(from: object.id, database: databaseName)
-        return try await execute(
-            .mongoFind(collection: collection, filter: "{}"),
-            options: ExecuteOptions(maxRows: Self.previewLimit)
-        )
+        let collection = try Self.collectionName(from: request.object.id, database: databaseName)
+        // maxRows = page size; the find limit is one larger, so a truncated
+        // result means a next page exists.
+        let options = ExecuteOptions(requestID: request.requestID, maxRows: request.normalizedLimit)
+        let commandPairs = try MongoPreviewPlanner.findCommandPairs(
+            collection: collection,
+            request: request,
+            timeoutMs: Self.timeoutMilliseconds(options.timeout))
+        return try await runCommand(commandPairs: commandPairs, collection: collection, options: options)
     }
 
     public func execute(_ command: DatabaseCommand, options: ExecuteOptions) async throws -> QueryResult {
         try assertOpen()
+        // Parse and validate before anything reaches the server.
+        let timeoutMs = Self.timeoutMilliseconds(options.timeout)
+        let parsed = try Self.parsedCommandPairs(command, timeoutMs: timeoutMs, maxRows: options.maxRows)
+        return try await runCommand(
+            commandPairs: parsed.pairs, collection: parsed.collection, options: options)
+    }
 
+    /// Parses and validates one editor command into its BSON command pairs —
+    /// shared by `execute` and `explain`, so an explained command is exactly
+    /// the command that would run. EJSON failures map to `invalidExtendedJSON`
+    /// before anything reaches the server.
+    private static func parsedCommandPairs(
+        _ command: DatabaseCommand,
+        timeoutMs: Int64,
+        maxRows: Int
+    ) throws -> (collection: String, pairs: [(key: String, value: BSONValue)]) {
         enum Kind { case find, aggregate }
         let kind: Kind
         let text: String
@@ -162,6 +190,41 @@ public final class MongoAdapter: DatabaseAdapter, Sendable {
             throw MongoAdapterError.noCollectionSelected
         }
 
+        let commandPairs: [(key: String, value: BSONValue)]
+        do {
+            switch kind {
+            case .find:
+                let filter = try EJSON.parseDocument(text, label: "A find filter")
+                commandPairs = [
+                    ("find", .string(collection)),
+                    ("filter", filter),
+                    ("limit", .int64(Int64(maxRows) + 1)),
+                    ("maxTimeMS", .int64(timeoutMs)),
+                ]
+            case .aggregate:
+                let stages = try EJSON.parsePipeline(text)
+                try Self.assertReadOnlyPipeline(stages)
+                commandPairs = [
+                    ("aggregate", .string(collection)),
+                    ("pipeline", .array(stages)),
+                    ("cursor", .document([])),
+                    ("maxTimeMS", .int64(timeoutMs)),
+                ]
+            }
+        } catch let error as EJSONError {
+            throw MongoAdapterError.invalidExtendedJSON(error.userMessage)
+        }
+        return (collection, commandPairs)
+    }
+
+    /// The shared execution core for parsed editor commands and planned
+    /// previews: request registration (cancellation/timeout pre-registration
+    /// works for both), the watchdog, the cursor run, and result assembly.
+    private func runCommand(
+        commandPairs: [(key: String, value: BSONValue)],
+        collection: String,
+        options: ExecuteOptions
+    ) async throws -> QueryResult {
         let requestState = MongoRequestState()
         try state.withLock { state in
             if state.closed { throw AdapterError.sessionClosed }
@@ -178,33 +241,6 @@ public final class MongoAdapter: DatabaseAdapter, Sendable {
                 state.active.removeValue(forKey: options.requestID)
                 state.cancelledRequestIDs.remove(options.requestID)
             }
-        }
-
-        // Parse and validate before anything reaches the server.
-        let timeoutMs = Self.timeoutMilliseconds(options.timeout)
-        let commandPairs: [(key: String, value: BSONValue)]
-        do {
-            switch kind {
-            case .find:
-                let filter = try EJSON.parseDocument(text, label: "A find filter")
-                commandPairs = [
-                    ("find", .string(collection)),
-                    ("filter", filter),
-                    ("limit", .int64(Int64(options.maxRows) + 1)),
-                    ("maxTimeMS", .int64(timeoutMs)),
-                ]
-            case .aggregate:
-                let stages = try EJSON.parsePipeline(text)
-                try Self.assertReadOnlyPipeline(stages)
-                commandPairs = [
-                    ("aggregate", .string(collection)),
-                    ("pipeline", .array(stages)),
-                    ("cursor", .document([])),
-                    ("maxTimeMS", .int64(timeoutMs)),
-                ]
-            }
-        } catch let error as EJSONError {
-            throw MongoAdapterError.invalidExtendedJSON(error.userMessage)
         }
 
         let startedAt = ContinuousClock.now
@@ -341,6 +377,28 @@ public final class MongoAdapter: DatabaseAdapter, Sendable {
 
     // MARK: - Pipeline guard
 
+    /// Runs one single-shot command whose reply is a plain document (not a
+    /// cursor) and returns its top-level pairs — used by explain, collStats,
+    /// and the server-activity commands. There is no cursor to kill, so
+    /// cancellation cannot interrupt the round trip; the command's own
+    /// maxTimeMS bounds the server work. `database` overrides the browsed
+    /// database for admin commands (currentOp/killOp live on admin).
+    private func runReplyDocument(
+        _ commandPairs: [(key: String, value: BSONValue)],
+        database: String? = nil
+    ) async throws -> [(key: String, value: BSONValue)] {
+        let commandData = try BSONWriter.encode(document: commandPairs)
+        let connection = try await cluster.next(for: .basic)
+        let reply = try await connection.executeCodable(
+            Document(data: commandData),
+            decodeAs: Document.self,
+            namespace: MongoNamespace(to: "$cmd", inDatabase: database ?? databaseName),
+            sessionId: connection.implicitSessionId
+        )
+        var reader = BSONReader(data: reply.makeData())
+        return try reader.readDocument()
+    }
+
     /// Write stages are scanned across every key of every stage — a stage with
     /// extra keys smuggled next to a read operator is still rejected.
     static func assertReadOnlyPipeline(_ stages: [BSONValue]) throws {
@@ -469,11 +527,12 @@ extension MongoAdapter: SupportsEditing {
     /// Same fixed server-side cap as the Electron adapter.
     private static let dataChangeMaxTimeMS: Int64 = 30_000
 
-    /// Applies one reviewed single-document change. The whole original
-    /// document is the optimistic-concurrency baseline: a zero matched/deleted
-    /// count means the document changed or vanished underneath the edit.
-    /// Read-only sessions are refused client-side here; server-side
-    /// authorization is the second layer.
+    /// Applies one reviewed single-document change. Updates and deletes use
+    /// the whole original document as the optimistic-concurrency baseline: a
+    /// zero matched/deleted count means the document changed or vanished
+    /// underneath the edit. Inserts have no baseline; a missing `_id` is
+    /// generated server-side. Read-only sessions are refused client-side
+    /// here; server-side authorization is the second layer.
     public func applyDataChange(_ change: DataChange) async throws -> QueryResult {
         try assertOpen()
         if profile.readOnly {
@@ -486,12 +545,22 @@ extension MongoAdapter: SupportsEditing {
         let collection = try Self.collectionName(from: change.object.id, database: databaseName)
 
         let startedAt = ContinuousClock.now
-        let original = try MongoChangePlanner.documentEntries(
-            change.original, label: "MongoDB original document")
 
         let commandPairs: [(key: String, value: BSONValue)]
         switch change.operation {
+        case .insert(let values):
+            // No optimistic lock for a document that does not exist yet; the
+            // reviewed EJSON converts through the same codec as edits.
+            let document = try MongoChangePlanner.planInsert(values)
+            commandPairs = [
+                ("insert", .string(collection)),
+                ("documents", .array([.document(document)])),
+                ("ordered", .bool(true)),
+                ("maxTimeMS", .int64(Self.dataChangeMaxTimeMS)),
+            ]
         case .update(let changed):
+            let original = try MongoChangePlanner.documentEntries(
+                change.original, label: "MongoDB original document")
             let changedEntries = try MongoChangePlanner.documentEntries(
                 changed, label: "MongoDB current document")
             var current = original
@@ -519,6 +588,8 @@ extension MongoAdapter: SupportsEditing {
                 ("maxTimeMS", .int64(Self.dataChangeMaxTimeMS)),
             ]
         case .delete:
+            let original = try MongoChangePlanner.documentEntries(
+                change.original, label: "MongoDB original document")
             let filter = try MongoChangePlanner.planDeleteFilter(original: original)
             commandPairs = [
                 ("delete", .string(collection)),
@@ -536,9 +607,16 @@ extension MongoAdapter: SupportsEditing {
                 throw MongoErrorMapper.mapDataChangeCode(writeError.code)
                     ?? .server("MongoDB could not apply the document change.")
             }
-            guard reply.n > 0 else {
-                throw MongoAdapterError.server(
-                    "MongoDB document changed or was deleted after it was loaded. Refresh it and try again.")
+            if case .insert = change.operation {
+                guard reply.n == 1 else {
+                    throw MongoAdapterError.server(
+                        "MongoDB refused a document insert with an unexpected inserted count.")
+                }
+            } else {
+                guard reply.n > 0 else {
+                    throw MongoAdapterError.server(
+                        "MongoDB document changed or was deleted after it was loaded. Refresh it and try again.")
+                }
             }
             let elapsed = max(0, Int((ContinuousClock.now - startedAt) / .milliseconds(1)))
             return .documents([], meta: ResultMeta(
@@ -550,9 +628,16 @@ extension MongoAdapter: SupportsEditing {
         }
     }
 
-    /// Runs one update/delete command and returns the server's affected-count
-    /// reply. Write commands share the find path's raw-command construction:
-    /// dbbbb's own BSON writer, wrapped in a `Document`, decoded as a reply.
+    /// Collections have no fixed columns, so there is no column metadata to
+    /// draft against; the insert UI uses the EJSON document editor instead.
+    public func insertableColumns(for object: DatabaseObject) async throws -> [InsertableColumn] {
+        throw AdapterError.notFound("MongoDB collections have no insertable-column metadata.")
+    }
+
+    /// Runs one update/delete/insert command and returns the server's
+    /// affected-count reply. Write commands share the find path's raw-command
+    /// construction: dbbbb's own BSON writer, wrapped in a `Document`, decoded
+    /// as a reply.
     private func runWriteCommand(
         _ commandPairs: [(key: String, value: BSONValue)]
     ) async throws -> MongoWriteReply {
@@ -614,6 +699,108 @@ extension MongoAdapter: SupportsImporting {
                 })
         } catch let error as ImportError {
             throw error
+        } catch let error as MongoAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            throw MongoErrorMapper.map(error)
+        }
+    }
+}
+
+// MARK: - Explaining
+
+extension MongoAdapter: SupportsExplain {
+    /// Explains the current editor command at queryPlanner verbosity
+    /// (ROADMAP M2 ⑧): the parsed find/aggregate command is wrapped as
+    /// `{explain: <cmd>, verbosity: "queryPlanner"}` — exactly the command
+    /// that would run, never executed. The reply is a single document, not
+    /// a cursor, so it runs through the single-shot command path and renders
+    /// as a documents result.
+    public func explain(_ command: DatabaseCommand, options: ExecuteOptions) async throws -> QueryResult {
+        try assertOpen()
+        let timeoutMs = Self.timeoutMilliseconds(options.timeout)
+        let parsed = try Self.parsedCommandPairs(command, timeoutMs: timeoutMs, maxRows: options.maxRows)
+        let startedAt = ContinuousClock.now
+        do {
+            let reply = try await runReplyDocument(
+                MongoExplainPlanner.explainCommandPairs(inner: parsed.pairs))
+            let elapsed = max(0, Int((ContinuousClock.now - startedAt) / .milliseconds(1)))
+            return .documents(
+                [MongoDisplayValue.convert(document: reply)],
+                meta: ResultMeta(count: 1, truncated: false, elapsedMilliseconds: elapsed))
+        } catch let error as MongoAdapterError {
+            throw error
+        } catch {
+            throw MongoErrorMapper.map(error)
+        }
+    }
+}
+
+// MARK: - Table statistics
+
+extension MongoAdapter: SupportsTableStatistics {
+    /// Collection statistics from `collStats` (ROADMAP M2 ⑩): exact document
+    /// count plus on-disk sizes; the uncompressed data size arrives as an
+    /// extra. Reading statistics is a read: read-only profiles still allow it.
+    public func tableStatistics(for object: DatabaseObject) async throws -> TableStatistics {
+        try assertOpen()
+        guard object.kind == .collection else {
+            throw AdapterError.notFound("MongoDB statistics require a collection target.")
+        }
+        let collection = try Self.collectionName(from: object.id, database: databaseName)
+        do {
+            let reply = try await runReplyDocument(
+                MongoStatisticsPlanner.collStatsCommandPairs(collection: collection))
+            return MongoStatisticsPlanner.statistics(reply: reply)
+        } catch let error as MongoAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            throw MongoErrorMapper.map(error)
+        }
+    }
+}
+
+// MARK: - Server activity
+
+extension MongoAdapter: SupportsServerActivity {
+    /// In-flight operations from `currentOp` on the admin database (ROADMAP M2
+    /// ⑨). Reading activity is a read: read-only profiles still allow it.
+    /// Privilege failures surface as a sanitized error, never a crash.
+    public func listActivity() async throws -> [ServerActivity] {
+        try assertOpen()
+        do {
+            let reply = try await runReplyDocument(
+                MongoActivityPlanner.currentOpCommandPairs(),
+                database: MongoActivityPlanner.adminDatabase)
+            return MongoActivityPlanner.activities(reply: reply)
+        } catch let error as MongoAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            throw MongoErrorMapper.map(error)
+        }
+    }
+
+    /// Kills one operation with `killOp` on the admin database. The session
+    /// layer gates kills to writable profiles; the adapter re-checks.
+    public func killActivity(id: String) async throws {
+        try assertOpen()
+        if profile.readOnly {
+            throw MongoAdapterError.server(
+                "Killing operations is disabled for read-only MongoDB connections.")
+        }
+        guard let opid = MongoActivityPlanner.opidValue(id) else {
+            throw AdapterError.notFound("This MongoDB activity id is no longer valid.")
+        }
+        do {
+            _ = try await runReplyDocument(
+                MongoActivityPlanner.killOpCommandPairs(opid: opid),
+                database: MongoActivityPlanner.adminDatabase)
         } catch let error as MongoAdapterError {
             throw error
         } catch let error as AdapterError {

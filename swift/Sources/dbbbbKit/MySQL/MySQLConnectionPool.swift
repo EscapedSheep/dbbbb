@@ -1,6 +1,21 @@
 import Foundation
 import dbbbbCore
 import MySQLNIO
+import Synchronization
+
+/// Exactly-one gate for the timeout races below: the first claimant wins and
+/// resumes the continuation; the loser cleans up. Mutex-backed, hence Sendable.
+private final class ResumeGate: @unchecked Sendable {
+    private let claimed = Mutex(false)
+
+    func claim() -> Bool {
+        claimed.withLock { flag in
+            if flag { return false }
+            flag = true
+            return true
+        }
+    }
+}
 
 /// Everything needed to open a MySQL connection, credentials included.
 /// Never crosses into the UI; error messages pass through `MySQLErrorSanitizer`.
@@ -36,7 +51,8 @@ struct MySQLLease: Sendable {
 
 /// Opens MySQL connections and prepares their sessions.
 enum MySQLConnector {
-    static let connectTimeout: Duration = .seconds(10)
+    /// Boxed so tests can shorten the budget. Production code never mutates it.
+    static let connectTimeout = Mutex<Duration>(.seconds(10))
     static let readOnlySessionSQL = "SET SESSION transaction_read_only = ON"
 
     /// What a fresh connection needs before it can serve queries.
@@ -53,11 +69,13 @@ enum MySQLConnector {
         on eventLoop: any EventLoop,
         logger: Logger
     ) async throws -> MySQLConnection {
-        let connection = try await withConnectTimeout {
+        let connection = try await withConnectTimeout({
             let address = try SocketAddress.makeAddressResolvingHost(config.host, port: config.port)
             return try await MySQLConnection.connect(
                 to: address,
                 username: config.username,
+                // An empty database is sent as an empty handshake schema; the
+                // server then starts the session with no default schema.
                 database: config.database,
                 password: config.password.isEmpty ? nil : config.password,
                 tlsConfiguration: config.tlsConfiguration,
@@ -65,7 +83,11 @@ enum MySQLConnector {
                 logger: logger,
                 on: eventLoop
             ).get()
-        }
+        }, onLateSuccess: { lateConnection in
+            // The timeout already won the race; this connection arrived too
+            // late to have an owner, so close it instead of leaking it.
+            Task { try? await lateConnection.close().get() }
+        })
 
         do {
             if config.tlsConfiguration != nil {
@@ -105,19 +127,34 @@ enum MySQLConnector {
         return UInt64(value)
     }
 
+    /// Races the operation against `connectTimeout` without ever awaiting the
+    /// loser: cancelling a task does not interrupt a pending NIO future, so
+    /// awaiting `operationTask.value` after `cancel()` would still hang until
+    /// the server (or the OS TCP stack) answers. Exactly one side resumes the
+    /// continuation; a late success is handed to `cleanup` because nobody else
+    /// owns it anymore.
     private static func withConnectTimeout<T: Sendable>(
-        _ operation: @escaping @Sendable () async throws -> T
+        _ operation: @escaping @Sendable () async throws -> T,
+        onLateSuccess cleanup: (@Sendable (T) -> Void)? = nil
     ) async throws -> T {
         let operationTask = Task { try await operation() }
-        let watchdog = Task {
-            try? await Task.sleep(for: connectTimeout)
-            operationTask.cancel()
-        }
-        defer { watchdog.cancel() }
-        do {
-            return try await operationTask.value
-        } catch is CancellationError {
-            throw MySQLAdapterError.connectTimedOut
+        let gate = ResumeGate()
+        return try await withCheckedThrowingContinuation { continuation in
+            Task {
+                let result = await operationTask.result
+                if gate.claim() {
+                    continuation.resume(with: result)
+                } else if case .success(let value) = result {
+                    cleanup?(value)
+                }
+            }
+            Task {
+                try? await Task.sleep(for: connectTimeout.withLock { $0 })
+                if gate.claim() {
+                    operationTask.cancel()
+                    continuation.resume(throwing: MySQLAdapterError.connectTimedOut)
+                }
+            }
         }
     }
 }

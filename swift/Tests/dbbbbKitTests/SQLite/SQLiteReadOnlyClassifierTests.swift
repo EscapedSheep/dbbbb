@@ -140,4 +140,16 @@ final class SQLiteReadOnlyClassifierTests: XCTestCase {
                            "SQLite connections only allow one SQL statement at a time.")
         }
     }
+
+    // MARK: - EXPLAIN viewer regression (ROADMAP M2 ⑧)
+
+    /// The Explain feature relies on the classifier allowing EXPLAIN /
+    /// EXPLAIN QUERY PLAN; the ANALYZE token must stay rejected.
+    func testExplainAllowedButAnalyzeStaysRejected() {
+        assertAllowed("EXPLAIN SELECT 1")
+        assertAllowed("EXPLAIN QUERY PLAN SELECT * FROM t")
+        assertRejected("EXPLAIN ANALYZE SELECT 1")
+        assertRejected("ANALYZE")
+        assertAllowed("SELECT 'analyze me'")
+    }
 }

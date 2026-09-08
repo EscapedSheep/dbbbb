@@ -315,4 +315,63 @@ final class PostgresChangePlannerTests: XCTestCase {
             label: "PostgreSQL original values"
         ))
     }
+
+    // MARK: - planInsert
+
+    func testInsertIsParameterizedInEntryOrderWithReturning() throws {
+        let plan = try PostgresChangePlanner.planInsert(
+            schema: "odd\"schema",
+            table: "user\"table",
+            entries: [("name", .string("ado\"le")), ("score", .number(9.5)), ("note", .null)])
+
+        XCTAssertEqual(plan.text, [
+            "INSERT INTO \"odd\"\"schema\".\"user\"\"table\" (\"name\", \"score\", \"note\")",
+            "VALUES ($1, $2, $3)",
+            "RETURNING *;",
+        ].joined(separator: "\n"))
+        XCTAssertEqual(plan.values, [.string("ado\"le"), .number(9.5), .null])
+    }
+
+    func testInsertWithNoEntriesUsesDefaultValues() throws {
+        let plan = try PostgresChangePlanner.planInsert(schema: "public", table: "t", entries: [])
+        XCTAssertEqual(plan.text, "INSERT INTO \"public\".\"t\" DEFAULT VALUES\nRETURNING *;")
+        XCTAssertEqual(plan.values, [])
+    }
+
+    func testInsertRejectsDangerousDuplicateAndInvalidFieldNames() {
+        assertPlanThrows(containing: "dangerous key") {
+            try PostgresChangePlanner.planInsert(
+                schema: "public", table: "t", entries: [("__proto__", .number(1))])
+        }
+        assertPlanThrows(containing: "duplicate field name") {
+            try PostgresChangePlanner.planInsert(
+                schema: "public", table: "t",
+                entries: [("a", .number(1)), ("a", .number(2))])
+        }
+        assertPlanThrows(containing: "invalid field name") {
+            try PostgresChangePlanner.planInsert(
+                schema: "public", table: "t", entries: [("a\0b", .number(1))])
+        }
+    }
+
+    /// Insert values are catalog-ordered and unknown columns rejected by the
+    /// same mapper as edits — generated columns (excluded from the metadata)
+    /// can never be targeted.
+    func testInsertValuesReuseTheEditMappingRules() throws {
+        let metadata = try PostgresChangePlanner.changeTableMetadata(rows: [
+            ("id", 23, "int4", 1),
+            ("note", 25, "text", 0),
+        ])
+        let entries = try PostgresChangeMapper.orderedEntries(
+            ["note": .string("x"), "id": .number(7)],
+            metadata: metadata,
+            label: "PostgreSQL insert values")
+        XCTAssertEqual(entries.map(\.column), ["id", "note"])
+
+        XCTAssertThrowsError(try PostgresChangeMapper.orderedEntries(
+            ["generated_col": .number(1)],
+            metadata: metadata,
+            label: "PostgreSQL insert values"
+        ))
+    }
 }

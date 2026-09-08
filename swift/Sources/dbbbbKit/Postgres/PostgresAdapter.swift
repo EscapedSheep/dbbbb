@@ -18,6 +18,13 @@ public actor PostgresAdapter: DatabaseAdapter {
     private let logger = Logger(label: "app.dbbbb.postgres")
     private let maxConnections = 4
 
+    /// Fallback database when the connection input leaves the field empty.
+    private static let maintenanceDatabase = "postgres"
+
+    /// The `unknown` type OID: preview equality binds declare it so the
+    /// server infers each parameter's type from the compared column.
+    private static let unknownTypeOID = 705
+
     private var idleConnections: [PostgresConnection] = []
     private var liveConnectionCount = 0
     private var waiters: [CheckedContinuation<PostgresConnection, any Error>] = []
@@ -35,10 +42,17 @@ public actor PostgresAdapter: DatabaseAdapter {
     public init(input: ConnectionInput.PostgresInput) throws {
         guard !input.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               (1...65_535).contains(input.port),
-              !input.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !input.database.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+              !input.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
             throw PostgresAdapterError(message: "PostgreSQL connection settings are invalid.")
+        }
+        // An empty database connects to the `postgres` maintenance database —
+        // the same fallback psql and most GUIs use — so an empty field never
+        // produces a nonsense connection.
+        var input = input
+        input.database = input.database.trimmingCharacters(in: .whitespacesAndNewlines)
+        if input.database.isEmpty {
+            input.database = Self.maintenanceDatabase
         }
         self.input = input
         self.profile = ConnectionProfile(
@@ -262,20 +276,43 @@ public actor PostgresAdapter: DatabaseAdapter {
         }
     }
 
-    public func previewObject(_ object: DatabaseObject) async throws -> QueryResult {
+    public func previewObject(_ request: PreviewRequest) async throws -> QueryResult {
         try checkOpen()
-        guard let ref = objects[object.id] ?? PostgresObjectIDCodec.decode(object.id),
+        guard let ref = objects[request.object.id] ?? PostgresObjectIDCodec.decode(request.object.id),
               ref.kind != .schema,
               let name = ref.name
         else {
             throw AdapterError.notFound("This PostgreSQL object cannot be previewed.")
         }
-        let sql = """
-            SELECT *
-            FROM \(try PostgresChangePlanner.quoteIdentifier(ref.schema)).\(try PostgresChangePlanner.quoteIdentifier(name))
-            LIMIT 100;
-            """
-        return try await execute(.sql(sql), options: ExecuteOptions())
+        let plan = try PostgresPreviewPlanner.plan(schema: ref.schema, table: name, request: request)
+        var binds = PostgresBindings()
+        if let pattern = plan.filterPattern {
+            // The filter value crosses as a text bind; the server infers text
+            // from the LIKE context. Never interpolated into the SQL.
+            binds.append(pattern)
+        }
+        // NULL equalities are rendered as `IS NULL` by the planner and bind
+        // nothing, so `equalityValues` holds the non-NULL ones in order.
+        for value in plan.equalityValues {
+            // Equality values bind like the change path's values: canonical
+            // text via `PostgresChangeMapper.bindText`, sent with the unknown
+            // type OID so the server infers the parameter type from the
+            // compared column (its input function parses the display text
+            // back exactly — bigint, numeric scale, bytea hex included).
+            guard let text = try PostgresChangeMapper.bindText(
+                for: value, label: "PostgreSQL preview equality value")
+            else {
+                throw PostgresAdapterError(message: "PostgreSQL preview planning failed.")
+            }
+            try binds.append(PostgresTextParameter(
+                psqlType: PostgresDataType(UInt32(clamping: Self.unknownTypeOID)), text: text))
+        }
+        // maxRows = page size; the SQL's LIMIT is one larger, so a truncated
+        // result means a next page exists.
+        return try await runSQL(
+            plan.sql,
+            binds: binds,
+            options: ExecuteOptions(requestID: request.requestID, maxRows: plan.limit))
     }
 
     // MARK: - Execute
@@ -284,8 +321,14 @@ public actor PostgresAdapter: DatabaseAdapter {
     private struct QueryCancelled: Error {}
 
     public func execute(_ command: DatabaseCommand, options: ExecuteOptions) async throws -> QueryResult {
-        try checkOpen()
         guard case .sql(let sql) = command else { throw AdapterError.engineMismatch }
+        return try await runSQL(sql, binds: PostgresBindings(), options: options)
+    }
+
+    /// The shared execution core for ad-hoc SQL and planned previews: bind
+    /// values travel in `binds` and are never interpolated into the text.
+    private func runSQL(_ sql: String, binds: PostgresBindings, options: ExecuteOptions) async throws -> QueryResult {
+        try checkOpen()
         guard !sql.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PostgresAdapterError(message: "PostgreSQL query cannot be empty.")
         }
@@ -340,7 +383,7 @@ public actor PostgresAdapter: DatabaseAdapter {
                 }
             }
 
-            let sequence = try await acquired.query(PostgresQuery(unsafeSQL: sql), logger: logger)
+            let sequence = try await acquired.query(PostgresQuery(unsafeSQL: sql, binds: binds), logger: logger)
             let columns = PostgresWireCodec.columnMetas(
                 sequence.columns.map { ($0.name, $0.dataType) })
 
@@ -555,31 +598,41 @@ extension PostgresAdapter: SupportsEditing {
             let metadata = try await PostgresChangePlanner.changeTableMetadata(
                 rows: Self.changeMetadataRows(from: metadataSequence))
 
-            let original = try PostgresChangeMapper.orderedEntries(
-                change.original, metadata: metadata, label: "PostgreSQL original values")
-            let current: [PostgresFieldEntry]?
-            switch change.operation {
-            case .update(let changed):
-                current = try PostgresChangeMapper.currentEntries(original: original, changed: changed)
-            case .delete:
-                current = nil
-            }
-            let primaryKey = try PostgresChangeMapper.primaryKeyEntries(
-                metadata: metadata, original: original)
-
             let plan: PostgresParameterizedPlan
-            if let current {
-                plan = try PostgresChangePlanner.planUpdate(
-                    schema: ref.schema, table: name, columnTypeOIDs: metadata.columnTypeOIDs,
+            let bindColumns: [String]
+            switch change.operation {
+            case .insert(let values):
+                // No optimistic lock for a row that does not exist yet; the
+                // reviewed values are catalog-ordered like the original patch.
+                let entries = try PostgresChangeMapper.orderedEntries(
+                    values, metadata: metadata, label: "PostgreSQL insert values")
+                plan = try PostgresChangePlanner.planInsert(
+                    schema: ref.schema, table: name, entries: entries)
+                bindColumns = entries.map(\.column)
+            case .update, .delete:
+                let original = try PostgresChangeMapper.orderedEntries(
+                    change.original, metadata: metadata, label: "PostgreSQL original values")
+                let current: [PostgresFieldEntry]?
+                if case .update(let changed) = change.operation {
+                    current = try PostgresChangeMapper.currentEntries(original: original, changed: changed)
+                } else {
+                    current = nil
+                }
+                let primaryKey = try PostgresChangeMapper.primaryKeyEntries(
+                    metadata: metadata, original: original)
+                if let current {
+                    plan = try PostgresChangePlanner.planUpdate(
+                        schema: ref.schema, table: name, columnTypeOIDs: metadata.columnTypeOIDs,
+                        primaryKey: primaryKey, original: original, current: current)
+                } else {
+                    plan = try PostgresChangePlanner.planDelete(
+                        schema: ref.schema, table: name, columnTypeOIDs: metadata.columnTypeOIDs,
+                        primaryKey: primaryKey, original: original)
+                }
+                bindColumns = PostgresChangeMapper.bindColumns(
                     primaryKey: primaryKey, original: original, current: current)
-            } else {
-                plan = try PostgresChangePlanner.planDelete(
-                    schema: ref.schema, table: name, columnTypeOIDs: metadata.columnTypeOIDs,
-                    primaryKey: primaryKey, original: original)
             }
 
-            let bindColumns = PostgresChangeMapper.bindColumns(
-                primaryKey: primaryKey, original: original, current: current)
             var binds = PostgresBindings()
             guard bindColumns.count == plan.values.count else {
                 throw PostgresAdapterError(message: "PostgreSQL change planning failed.")
@@ -692,6 +745,48 @@ extension PostgresAdapter: SupportsEditing {
     private static func integer<T: FixedWidthInteger>(_ cell: PostgresCell, as type: T.Type) -> T? {
         guard let bytes = cell.bytes else { return nil }
         return PostgresWireCodec.readInt(Array(bytes.readableBytesView), as: type)
+    }
+
+    /// Insertable columns for building insert drafts — the same introspection
+    /// and validation as `applyDataChange` (generated/identity columns
+    /// excluded, round-trip refusal list enforced). Reading metadata is a
+    /// read: read-only profiles still allow it.
+    public func insertableColumns(for object: DatabaseObject) async throws -> [InsertableColumn] {
+        try checkOpen()
+        guard let ref = objects[object.id] ?? PostgresObjectIDCodec.decode(object.id),
+              ref.kind == .table,
+              let name = ref.name
+        else {
+            throw AdapterError.notFound("PostgreSQL insert drafts require an introspected table target.")
+        }
+
+        let connection = try await acquireConnection()
+        defer { releaseConnection(connection, destroy: connection.isClosed) }
+        do {
+            var binds = PostgresBindings()
+            binds.append(ref.schema)
+            binds.append(name)
+            let sequence = try await connection.query(
+                PostgresQuery(
+                    unsafeSQL: PostgresChangePlanner.listTableChangeColumnsSQL,
+                    binds: binds),
+                logger: logger)
+            let metadata = try await PostgresChangePlanner.changeTableMetadata(
+                rows: Self.changeMetadataRows(from: sequence))
+            let ordinals = Dictionary(
+                metadata.primaryKey.enumerated().map { ($0.element, $0.offset + 1) }) { first, _ in first }
+            return metadata.columns.map {
+                InsertableColumn(name: $0, primaryKeyOrdinal: ordinals[$0] ?? 0)
+            }
+        } catch {
+            if let planError = error as? PostgresChangePlanError { throw planError }
+            if let adapterError = error as? PostgresAdapterError { throw adapterError }
+            if let adapterError = error as? AdapterError { throw adapterError }
+            throw PostgresErrorSanitizer.sanitized(
+                action: "PostgreSQL could not read the table columns",
+                error: error,
+                secrets: [input.password])
+        }
     }
 }
 
@@ -849,5 +944,485 @@ extension PostgresAdapter: SupportsImporting {
                 message: "PostgreSQL import target has no insertable columns.")
         }
         return columns
+    }
+}
+
+
+// MARK: - Introspection
+
+extension PostgresAdapter: SupportsIntrospection {
+    /// PostgreSQL has no SHOW CREATE: the statement is *reconstructed* from
+    /// pg_catalog — a readable approximation, not pg_dump-grade (see
+    /// `PostgresIntrospectionPlanner` for the exact fidelity bounds).
+    /// Anything that is not a plain table/view fails closed. Reading DDL is
+    /// a read: allowed on read-only profiles.
+    public func createStatement(for object: DatabaseObject) async throws -> String {
+        try checkOpen()
+        guard let ref = objects[object.id] ?? PostgresObjectIDCodec.decode(object.id),
+              ref.kind == .table || ref.kind == .view,
+              let name = ref.name
+        else {
+            throw AdapterError.notFound(
+                "PostgreSQL create statements require an introspected table or view target.")
+        }
+
+        let connection = try await acquireConnection()
+        var destroyConnection = false
+        defer {
+            releaseConnection(connection, destroy: destroyConnection || connection.isClosed)
+        }
+
+        do {
+            var oidBinds = PostgresBindings()
+            oidBinds.append(ref.schema)
+            oidBinds.append(name)
+            let oidSequence = try await connection.query(
+                PostgresQuery(
+                    unsafeSQL: PostgresIntrospectionPlanner.relationOIDSQL(isView: ref.kind == .view),
+                    binds: oidBinds),
+                logger: logger)
+            var relationOID: UInt32?
+            for try await row in oidSequence {
+                let cells = row.map { $0 }
+                guard cells.count == 1,
+                      let value = Self.integer(cells[0], as: UInt32.self), value > 0
+                else {
+                    throw PostgresAdapterError(
+                        message: "PostgreSQL returned invalid object metadata.")
+                }
+                relationOID = value
+            }
+            guard let relationOID else {
+                throw AdapterError.notFound(
+                    "This PostgreSQL object no longer exists. Refresh the object list and try again.")
+            }
+
+            if ref.kind == .view {
+                let definitions = try await Self.textRows(
+                    from: connection, sql: PostgresIntrospectionPlanner.viewDefinitionSQL(
+                        relationOID: relationOID),
+                    logger: logger)
+                return try PostgresIntrospectionPlanner.createViewStatement(
+                    schema: ref.schema, name: name, definition: definitions.first ?? "")
+            }
+
+            let columnSequence = try await connection.query(
+                PostgresQuery(
+                    unsafeSQL: PostgresIntrospectionPlanner.columnListingSQL(relationOID: relationOID)),
+                logger: logger)
+            var columns: [PostgresIntrospectionColumn] = []
+            for try await row in columnSequence {
+                let cells = row.map { $0 }
+                guard cells.count == 4,
+                      let columnName = Self.text(cells[0]),
+                      let typeName = Self.text(cells[1]),
+                      let notNull = Self.text(cells[2])
+                else {
+                    throw PostgresAdapterError(
+                        message: "PostgreSQL returned invalid object metadata.")
+                }
+                columns.append(PostgresIntrospectionColumn(
+                    name: columnName,
+                    type: typeName,
+                    notNull: notNull == "true",
+                    defaultExpression: Self.text(cells[3])))
+            }
+
+            let keySequence = try await connection.query(
+                PostgresQuery(
+                    unsafeSQL: PostgresIntrospectionPlanner.primaryKeySQL(relationOID: relationOID)),
+                logger: logger)
+            var primaryKeyName: String?
+            var primaryKeyColumns: [String] = []
+            for try await row in keySequence {
+                let cells = row.map { $0 }
+                guard cells.count == 2,
+                      let constraintName = Self.text(cells[0]),
+                      let columnName = Self.text(cells[1])
+                else {
+                    throw PostgresAdapterError(
+                        message: "PostgreSQL returned invalid object metadata.")
+                }
+                primaryKeyName = primaryKeyName ?? constraintName
+                primaryKeyColumns.append(columnName)
+            }
+
+            let indexDefinitions = try await Self.textRows(
+                from: connection,
+                sql: PostgresIntrospectionPlanner.uniqueIndexSQL(relationOID: relationOID),
+                logger: logger)
+
+            return try PostgresIntrospectionPlanner.createTableStatement(
+                schema: ref.schema, name: name, columns: columns,
+                primaryKey: primaryKeyName.map { ($0, primaryKeyColumns) },
+                uniqueIndexDefinitions: indexDefinitions)
+        } catch let error as PostgresChangePlanError {
+            throw error
+        } catch let error as PostgresAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            destroyConnection = Self.isConnectionFailure(error)
+            throw PostgresErrorSanitizer.sanitized(
+                action: "Could not read the PostgreSQL create statement",
+                error: error,
+                secrets: [input.password])
+        }
+    }
+
+    /// Single-text-column rows (server-rendered definitions), read byte-wise
+    /// like the change-metadata decoders.
+    private static func textRows(
+        from connection: PostgresConnection,
+        sql: String,
+        logger: Logger
+    ) async throws -> [String] {
+        let sequence = try await connection.query(
+            PostgresQuery(unsafeSQL: sql), logger: logger)
+        var values: [String] = []
+        for try await row in sequence {
+            let cells = row.map { $0 }
+            guard cells.count == 1, let value = text(cells[0]) else {
+                throw PostgresAdapterError(
+                    message: "PostgreSQL returned invalid object metadata.")
+            }
+            values.append(value)
+        }
+        return values
+    }
+}
+
+// MARK: - Foreign keys
+
+extension PostgresAdapter: SupportsForeignKeys {
+    /// Foreign keys of one introspected table (ROADMAP M1 ⑤), grouped by
+    /// constraint with conkey/confkey ordinal pairing. Reading metadata is a
+    /// read: read-only profiles still allow it.
+    public func foreignKeys(for object: DatabaseObject) async throws -> [ForeignKey] {
+        try checkOpen()
+        guard let ref = objects[object.id] ?? PostgresObjectIDCodec.decode(object.id),
+              ref.kind != .schema,
+              let name = ref.name
+        else {
+            throw AdapterError.notFound("PostgreSQL foreign keys require an introspected table target.")
+        }
+
+        let connection = try await acquireConnection()
+        var destroyConnection = false
+        defer {
+            releaseConnection(connection, destroy: destroyConnection || connection.isClosed)
+        }
+        do {
+            var binds = PostgresBindings()
+            binds.append(ref.schema)
+            binds.append(name)
+            let sequence = try await connection.query(
+                PostgresQuery(
+                    unsafeSQL: PostgresForeignKeyPlanner.listForeignKeysSQL,
+                    binds: binds),
+                logger: logger)
+            var rows: [(constraint: String, column: String, referencedSchema: String,
+                        referencedTable: String, referencedKind: String, referencedColumn: String)] = []
+            for try await row in sequence {
+                let cells = row.map { $0 }
+                guard cells.count == 6,
+                      let constraint = Self.text(cells[0]),
+                      let column = Self.text(cells[1]),
+                      let referencedSchema = Self.text(cells[2]),
+                      let referencedTable = Self.text(cells[3]),
+                      let referencedKind = Self.text(cells[4]),
+                      let referencedColumn = Self.text(cells[5])
+                else {
+                    throw PostgresAdapterError(
+                        message: "PostgreSQL returned invalid foreign-key metadata.")
+                }
+                rows.append((constraint, column, referencedSchema,
+                             referencedTable, referencedKind, referencedColumn))
+            }
+            return try PostgresForeignKeyPlanner.foreignKeys(rows: rows)
+        } catch let error as PostgresAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            destroyConnection = Self.isConnectionFailure(error)
+            throw PostgresErrorSanitizer.sanitized(
+                action: "PostgreSQL could not read the foreign keys",
+                error: error,
+                secrets: [input.password])
+        }
+    }
+}
+
+// MARK: - Table statistics
+
+extension PostgresAdapter: SupportsTableStatistics {
+    /// Planner estimate (`pg_class.reltuples`) plus exact byte sizes
+    /// (`pg_total_relation_size`/`pg_indexes_size`) for one introspected
+    /// table or view (ROADMAP M2 ⑩); names cross as binds through the
+    /// schema-qualified object handle. Reading statistics is a read:
+    /// read-only profiles still allow it.
+    public func tableStatistics(for object: DatabaseObject) async throws -> TableStatistics {
+        try checkOpen()
+        guard let ref = objects[object.id] ?? PostgresObjectIDCodec.decode(object.id),
+              ref.kind == .table || ref.kind == .view,
+              let name = ref.name
+        else {
+            throw AdapterError.notFound(
+                "PostgreSQL statistics require an introspected table or view target.")
+        }
+
+        let connection = try await acquireConnection()
+        var destroyConnection = false
+        defer {
+            releaseConnection(connection, destroy: destroyConnection || connection.isClosed)
+        }
+        do {
+            var binds = PostgresBindings()
+            binds.append(ref.schema)
+            binds.append(name)
+            let sequence = try await connection.query(
+                PostgresQuery(
+                    unsafeSQL: PostgresStatisticsPlanner.statisticsSQL,
+                    binds: binds),
+                logger: logger)
+            var statistics: TableStatistics?
+            for try await row in sequence {
+                let cells = row.map { $0 }
+                guard cells.count == 3 else {
+                    throw PostgresAdapterError(
+                        message: "PostgreSQL returned invalid statistics metadata.")
+                }
+                statistics = PostgresStatisticsPlanner.statistics(
+                    reltuples: Self.integer(cells[0], as: Int64.self),
+                    totalBytes: Self.integer(cells[1], as: Int64.self),
+                    indexBytes: Self.integer(cells[2], as: Int64.self))
+            }
+            guard let statistics else {
+                throw AdapterError.notFound(
+                    "This PostgreSQL object no longer exists. Refresh the object list and try again.")
+            }
+            return statistics
+        } catch let error as PostgresAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            destroyConnection = Self.isConnectionFailure(error)
+            throw PostgresErrorSanitizer.sanitized(
+                action: "PostgreSQL could not read the table statistics",
+                error: error,
+                secrets: [input.password])
+        }
+    }
+}
+
+// MARK: - Server activity
+
+extension PostgresAdapter: SupportsServerActivity {
+    /// A `pg_stat_activity` snapshot (ROADMAP M2 ⑨): every backend except our
+    /// own, statements excerpted server-side. Reading activity is a read:
+    /// read-only profiles still allow it.
+    public func listActivity() async throws -> [ServerActivity] {
+        try checkOpen()
+        let connection = try await acquireConnection()
+        var destroyConnection = false
+        defer {
+            releaseConnection(connection, destroy: destroyConnection || connection.isClosed)
+        }
+        do {
+            let sequence = try await connection.query(
+                PostgresQuery(unsafeSQL: PostgresActivityPlanner.listActivitySQL),
+                logger: logger)
+            var activities: [ServerActivity] = []
+            for try await row in sequence {
+                let cells = row.map { $0 }
+                guard cells.count == 6 else {
+                    throw PostgresAdapterError(
+                        message: "PostgreSQL returned invalid activity metadata.")
+                }
+                if let activity = PostgresActivityPlanner.activity(
+                    pid: Self.text(cells[0]),
+                    user: Self.text(cells[1]),
+                    database: Self.text(cells[2]),
+                    state: Self.text(cells[3]),
+                    ageSeconds: PostgresActivityPlanner.ageSeconds(Self.text(cells[4])),
+                    statement: Self.text(cells[5])) {
+                    activities.append(activity)
+                }
+            }
+            return activities
+        } catch let error as PostgresAdapterError {
+            throw error
+        } catch {
+            destroyConnection = Self.isConnectionFailure(error)
+            throw PostgresErrorSanitizer.sanitized(
+                action: "PostgreSQL could not list the server activity",
+                error: error,
+                secrets: [input.password])
+        }
+    }
+
+    /// Cancels one backend through `pg_cancel_backend` — deliberately a
+    /// *cancel*, not `pg_terminate_backend`: the app's calm philosophy
+    /// interrupts the running statement but leaves the client's connection
+    /// (and transaction) alive to retry. The session layer gates kills to
+    /// writable profiles; the adapter re-checks. Runs on the dedicated
+    /// out-of-pool connection of the cancel machinery, so killing our own
+    /// in-flight query never queues behind a saturated pool.
+    public func killActivity(id: String) async throws {
+        try checkOpen()
+        if input.readOnly || profile.readOnly {
+            throw PostgresAdapterError(
+                message: "PostgreSQL activity kills are disabled for read-only connections.")
+        }
+        guard let backendPID = Int32(id), backendPID > 0 else {
+            throw AdapterError.notFound("This PostgreSQL activity id is no longer valid.")
+        }
+        do {
+            try await dispatchCancel(backendPID: backendPID)
+        } catch let error as PostgresAdapterError {
+            throw error
+        } catch {
+            throw PostgresErrorSanitizer.sanitized(
+                action: "Could not cancel the PostgreSQL backend",
+                error: error,
+                secrets: [input.password])
+        }
+    }
+}
+
+// MARK: - Schema introspection
+
+extension PostgresAdapter: SupportsSchemaIntrospection {
+    /// Structured schema of one introspected table or view: columns with
+    /// nullability and primary-key ordinals, grouped indexes, and foreign
+    /// keys (the `SupportsForeignKeys` query; views have none). Reading
+    /// metadata is a read: read-only profiles still allow it.
+    public func schema(for object: DatabaseObject) async throws -> TableSchema {
+        try checkOpen()
+        guard let ref = objects[object.id] ?? PostgresObjectIDCodec.decode(object.id),
+              ref.kind == .table || ref.kind == .view,
+              let name = ref.name
+        else {
+            throw AdapterError.notFound(
+                "PostgreSQL schemas require an introspected table or view target.")
+        }
+
+        let connection = try await acquireConnection()
+        var destroyConnection = false
+        defer {
+            releaseConnection(connection, destroy: destroyConnection || connection.isClosed)
+        }
+        do {
+            var binds = PostgresBindings()
+            binds.append(ref.schema)
+            binds.append(name)
+
+            let columnSequence = try await connection.query(
+                PostgresQuery(unsafeSQL: PostgresSchemaPlanner.listColumnsSQL, binds: binds),
+                logger: logger)
+            var columnRows: [(name: String, dataType: String, nullable: Bool,
+                              primaryKeyOrdinal: Int)] = []
+            for try await row in columnSequence {
+                let cells = row.map { $0 }
+                guard cells.count == 4,
+                      let columnName = Self.text(cells[0]),
+                      let dataType = Self.text(cells[1]),
+                      let nullable = Self.text(cells[2]),
+                      let ordinal = Self.integer(cells[3], as: Int32.self)
+                else {
+                    throw PostgresAdapterError(
+                        message: "PostgreSQL returned invalid schema metadata.")
+                }
+                columnRows.append((columnName, dataType, nullable == "true", Int(ordinal)))
+            }
+            let columns = try PostgresSchemaPlanner.columns(rows: columnRows)
+
+            let indexSequence = try await connection.query(
+                PostgresQuery(unsafeSQL: PostgresSchemaPlanner.listIndexesSQL, binds: binds),
+                logger: logger)
+            var indexRows: [(name: String, isUnique: Bool, column: String)] = []
+            for try await row in indexSequence {
+                let cells = row.map { $0 }
+                guard cells.count == 3,
+                      let indexName = Self.text(cells[0]),
+                      let isUnique = Self.text(cells[1]),
+                      let column = Self.text(cells[2])
+                else {
+                    throw PostgresAdapterError(
+                        message: "PostgreSQL returned invalid schema metadata.")
+                }
+                indexRows.append((indexName, isUnique == "true", column))
+            }
+            let indexes = try PostgresSchemaPlanner.indexes(rows: indexRows)
+
+            // The foreign keys reuse the `SupportsForeignKeys` query path
+            // (its own pooled connection and folding); views simply have none.
+            let keys = ref.kind == .table ? try await foreignKeys(for: object) : []
+
+            return TableSchema(object: object, columns: columns, foreignKeys: keys, indexes: indexes)
+        } catch let error as PostgresAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            destroyConnection = Self.isConnectionFailure(error)
+            throw PostgresErrorSanitizer.sanitized(
+                action: "PostgreSQL could not read the table schema",
+                error: error,
+                secrets: [input.password])
+        }
+    }
+
+    /// Every foreign-key edge across the user schemas (ROADMAP-style overview
+    /// behind "View Schema" → Relationships), reusing the single-table
+    /// folding per source table. Reading metadata is a read: read-only
+    /// profiles still allow it.
+    public func allForeignKeys() async throws -> [TableRelation] {
+        try checkOpen()
+        let connection = try await acquireConnection()
+        var destroyConnection = false
+        defer {
+            releaseConnection(connection, destroy: destroyConnection || connection.isClosed)
+        }
+        do {
+            let sequence = try await connection.query(
+                PostgresQuery(unsafeSQL: PostgresSchemaPlanner.listAllForeignKeysSQL),
+                logger: logger)
+            var rows: [(schema: String, table: String, constraint: String, column: String,
+                        referencedSchema: String, referencedTable: String,
+                        referencedKind: String, referencedColumn: String)] = []
+            for try await row in sequence {
+                let cells = row.map { $0 }
+                guard cells.count == 8,
+                      let schema = Self.text(cells[0]),
+                      let table = Self.text(cells[1]),
+                      let constraint = Self.text(cells[2]),
+                      let column = Self.text(cells[3]),
+                      let referencedSchema = Self.text(cells[4]),
+                      let referencedTable = Self.text(cells[5]),
+                      let referencedKind = Self.text(cells[6]),
+                      let referencedColumn = Self.text(cells[7])
+                else {
+                    throw PostgresAdapterError(
+                        message: "PostgreSQL returned invalid foreign-key metadata.")
+                }
+                rows.append((schema, table, constraint, column, referencedSchema,
+                             referencedTable, referencedKind, referencedColumn))
+            }
+            return try PostgresSchemaPlanner.allForeignKeys(rows: rows)
+        } catch let error as PostgresAdapterError {
+            throw error
+        } catch let error as AdapterError {
+            throw error
+        } catch {
+            destroyConnection = Self.isConnectionFailure(error)
+            throw PostgresErrorSanitizer.sanitized(
+                action: "PostgreSQL could not read the foreign keys",
+                error: error,
+                secrets: [input.password])
+        }
     }
 }
