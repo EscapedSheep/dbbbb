@@ -227,7 +227,7 @@ struct ImportSheet: View {
             "The file runs in one transaction and rolls back if a batch fails."
         case .sqlite:
             "Each batch is its own transaction; a failed batch rolls back, earlier batches stay."
-        case .mongodb, nil:
+        case .mongodb, .bullmq, nil:
             "MongoDB imports are not transactional; a failed import may be partially complete."
         }
     }

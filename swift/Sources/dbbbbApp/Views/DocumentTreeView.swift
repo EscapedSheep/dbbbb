@@ -29,13 +29,13 @@ struct DocumentTreeView: View {
                 OutlineGroup(roots, children: \.children) { node in
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(node.label)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(AppColors.textDisabled)
                         if let text = node.valueText {
                             Text(text)
-                                .foregroundStyle(node.isNull ? .tertiary : .primary)
+                                .foregroundStyle(node.isNull ? AppColors.textDisabled : AppColors.textSecondary)
                         }
                     }
-                    .font(.system(.body, design: .monospaced))
+                    .font(AppFonts.monoUI(12))
                     .textSelection(.enabled)
                     .contextMenu {
                         if let index = node.documentIndex, store.editingObject != nil {
@@ -52,8 +52,10 @@ struct DocumentTreeView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(12)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
             }
+            .background(AppColors.bgPanel)
             .sheet(item: $editingState) { _ in
                 RecordEditingSheet(state: $editingState)
             }

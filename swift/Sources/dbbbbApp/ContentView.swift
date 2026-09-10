@@ -1,25 +1,112 @@
 import SwiftUI
 
-/// Three-column shell: connections (sidebar) · objects (content) · query & results (detail).
+/// The Electron-style shell: a 44px header (wordmark + connection breadcrumb +
+/// window actions), a single-column sidebar (connections + objects), the
+/// workspace, and a 24px status bar across the bottom.
 struct ContentView: View {
     @Environment(SessionStore.self) private var store
     @AppStorage("appearance") private var appearance: AppAppearance = .system
 
     var body: some View {
         @Bindable var store = store
-        NavigationSplitView {
-            ConnectionListView()
-                .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
-        } content: {
-            ObjectListView()
-                .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 300)
-        } detail: {
-            QueryWorkspaceView()
+        VStack(spacing: 0) {
+            AppHeaderView()
+            HStack(spacing: 0) {
+                SidebarView()
+                QueryWorkspaceView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxHeight: .infinity)
+            StatusBarView()
+                .frame(height: AppMetrics.statusBarHeight)
         }
-        .navigationSplitViewStyle(.balanced)
+        .background(AppColors.bgApp)
         .preferredColorScheme(appearance.colorScheme)
         .sheet(isPresented: $store.showingNewConnection) {
             NewConnectionView()
+        }
+    }
+}
+
+/// The top bar: wordmark, breadcrumb of the selected connection, and the
+/// window-level actions (appearance, new connection).
+private struct AppHeaderView: View {
+    @Environment(SessionStore.self) private var store
+    @AppStorage("appearance") private var appearance: AppAppearance = .system
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Wordmark()
+            Rectangle()
+                .fill(AppColors.border)
+                .frame(width: 1, height: 18)
+                .padding(.trailing, 6)
+            if let profile = store.selectedSession?.profile {
+                HStack(spacing: 6) {
+                    Text(profile.name)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(AppColors.textSecondary)
+                        .lineLimit(1)
+                    Text("/")
+                        .foregroundStyle(AppColors.borderStrong)
+                    Text(profile.database)
+                        .font(.system(size: 12))
+                        .foregroundStyle(AppColors.textDisabled)
+                        .lineLimit(1)
+                }
+            }
+            Spacer()
+            Menu {
+                ForEach(AppAppearance.allCases) { mode in
+                    Button {
+                        appearance = mode
+                    } label: {
+                        if mode == appearance {
+                            Label(mode.title, systemImage: "checkmark")
+                        } else {
+                            Text(mode.title)
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "circle.lefthalf.filled")
+                    .font(.system(size: 12))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: 30, height: 30)
+            .help("Appearance")
+        }
+        .padding(.leading, 78) // clear the traffic lights (hidden title bar)
+        .padding(.trailing, 10)
+        .frame(height: AppMetrics.headerHeight)
+        .background(AppColors.bgPanel)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(AppColors.border).frame(height: 1)
+        }
+    }
+}
+
+/// The boxed wordmark (reference `.wordmark` / `.wordmark-mark`).
+private struct Wordmark: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(spacing: 3) {
+                ForEach(0..<3, id: \.self) { _ in
+                    Rectangle()
+                        .fill(AppColors.text)
+                        .frame(height: 1)
+                }
+            }
+            .frame(width: 12, height: 12)
+            .padding(3)
+            .overlay(
+                RoundedRectangle(cornerRadius: AppMetrics.cornerRadius)
+                    .stroke(AppColors.text, lineWidth: 1))
+            Text("dbbbb")
+                .font(.system(size: 13, weight: .semibold))
+                .tracking(-0.2)
+                .foregroundStyle(AppColors.text)
         }
     }
 }

@@ -166,6 +166,8 @@ struct ActivitySheet: View {
             "MySQL kills the whole connection, not just the running statement."
         case .mongodb:
             "MongoDB aborts the operation; the client connection stays alive."
+        case .bullmq:
+            "BullMQ stops the scan between batches; the connection stays alive."
         case .sqlite, nil:
             ""
         }

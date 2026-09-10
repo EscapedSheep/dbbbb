@@ -1,15 +1,16 @@
 import SwiftUI
 
-/// The workspace's result tab bar (ROADMAP M3 多结果标签页): one chip per tab
-/// (title, spinner while its query runs, close button), a trailing "+" to
-/// open a tab. Switching never loses a tab's state — editor text, result,
-/// preview paging, and staged batch all live on the tab.
+/// The workspace's result tab bar (ROADMAP M3 多结果标签页), restyled to the
+/// Electron reference: 32px bottom-anchored tabs on a subtle strip, the active
+/// tab panel-colored with top/side borders, a trailing "+" opens a tab.
+/// Switching never loses a tab's state — editor text, result, preview paging,
+/// and staged batch all live on the tab.
 struct QueryTabBar: View {
     @Environment(SessionStore.self) private var store
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 4) {
+            HStack(alignment: .bottom, spacing: 2) {
                 ForEach(store.tabs) { tab in
                     TabChip(tab: tab, isSelected: tab.id == store.selectedTabID)
                 }
@@ -17,14 +18,17 @@ struct QueryTabBar: View {
                     store.newTab()
                 } label: {
                     Image(systemName: "plus")
+                        .font(.system(size: 11))
                 }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
+                .buttonStyle(.appIcon)
+                .padding(.bottom, 3)
                 .help("New tab")
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.horizontal, 5)
+        }
+        .background(AppColors.bgSubtle)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(AppColors.border).frame(height: 1)
         }
     }
 }
@@ -34,40 +38,51 @@ private struct TabChip: View {
 
     let tab: QueryTab
     let isSelected: Bool
+    @State private var hovered = false
 
     var body: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 7) {
             if tab.isExecuting {
                 ProgressView()
                     .controlSize(.mini)
             }
             Text(tab.title)
+                .font(.system(size: 12))
                 .lineLimit(1)
-                .foregroundStyle(tab.isDraft && !isSelected ? .tertiary : .primary)
+                .foregroundStyle(
+                    isSelected ? AppColors.text
+                        : tab.isDraft ? AppColors.textDisabled
+                        : AppColors.textSecondary)
             Button {
                 store.closeTab(tab.id)
             } label: {
                 Image(systemName: "xmark")
-                    .font(.caption2)
+                    .font(.system(size: 9, weight: .semibold))
             }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
+            .buttonStyle(AppIconButtonStyle(size: 16))
             .help("Close tab")
         }
-        .font(.caption)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .frame(minWidth: 100, maxWidth: 200, minHeight: 32)
         .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
-        )
+            UnevenRoundedRectangle(topLeadingRadius: AppMetrics.cornerRadius,
+                                   topTrailingRadius: AppMetrics.cornerRadius)
+                .fill(isSelected ? AppColors.bgPanel
+                      : hovered ? AppColors.bgHover : .clear))
         .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(isSelected ? Color.accentColor.opacity(0.35) : Color(nsColor: .separatorColor),
-                        lineWidth: 1)
-        )
+            UnevenRoundedRectangle(topLeadingRadius: AppMetrics.cornerRadius,
+                                   topTrailingRadius: AppMetrics.cornerRadius)
+                .stroke(isSelected ? AppColors.border : .clear, lineWidth: 1))
+        // Cover the active tab's bottom edge so it reads as part of the panel
+        // below, not as a chip floating on the strip.
+        .overlay(alignment: .bottom) {
+            if isSelected {
+                Rectangle().fill(AppColors.bgPanel).frame(height: 1)
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture { store.selectTab(tab.id) }
+        .onHover { hovered = $0 }
         .help(tab.title)
     }
 }

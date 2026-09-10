@@ -19,6 +19,8 @@ struct NewConnectionView: View {
     @State private var mongoURI = "mongodb://localhost:27017"
     @State private var mongoTLS = false
     @State private var sqlitePath = ""
+    @State private var bullPrefix = "bull"
+    @State private var bullTLS = false
     @State private var environment: ConnectionEnvironment = .development
     @State private var readOnly = false
     @State private var addError: String?
@@ -27,22 +29,21 @@ struct NewConnectionView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                HStack {
-                    Spacer()
-                    Picker("Engine", selection: $engine) {
-                        ForEach(DatabaseEngine.allCases, id: \.self) { engine in
-                            Text(engine.displayName).tag(engine)
+                // Engine cards, two per row (reference `.engine-picker`).
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                    ForEach(DatabaseEngine.allCases, id: \.self) { candidate in
+                        EngineOptionCard(engine: candidate, isSelected: candidate == engine) {
+                            engine = candidate
+                            switch candidate {
+                            case .mysql: port = "3306"
+                            case .bullmq: port = "6379"
+                            default: port = "5432"
+                            }
+                            addError = nil
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .fixedSize()
-                    .onChange(of: engine) { _, newEngine in
-                        port = newEngine == .mysql ? "3306" : "5432"
-                        addError = nil
-                    }
-                    Spacer()
                 }
+                .padding(.vertical, 4)
 
                 Section("Connection") {
                     TextField("Name", text: $name, prompt: Text(engine.displayName))
@@ -73,6 +74,13 @@ struct NewConnectionView: View {
                                 .font(.system(.body, design: .monospaced))
                             Button("Choose…") { chooseSQLiteFile() }
                         }
+                    case .bullmq:
+                        TextField("Host", text: $host)
+                        TextField("Port", text: $port)
+                        SecureField("Password", text: $password, prompt: Text("Optional — Redis AUTH"))
+                        TextField("Database", text: $database, prompt: Text("0–15"))
+                        TextField("Key Prefix", text: $bullPrefix, prompt: Text("bull"))
+                        Toggle("TLS", isOn: $bullTLS)
                     }
                 }
 
@@ -97,7 +105,7 @@ struct NewConnectionView: View {
                     Section {
                         ForEach(issues, id: \.self) { issue in
                             Label(issue, systemImage: "exclamationmark.circle")
-                                .foregroundStyle(.red)
+                                .foregroundStyle(AppColors.danger)
                                 .font(.callout)
                         }
                     }
@@ -105,14 +113,15 @@ struct NewConnectionView: View {
                 if let addError {
                     Section {
                         Label(addError, systemImage: "exclamationmark.circle")
-                            .foregroundStyle(.red)
+                            .foregroundStyle(AppColors.danger)
                             .font(.callout)
                     }
                 }
             }
             .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .background(AppColors.bgPanel)
 
-            Divider()
             HStack {
                 if isSubmitting {
                     ProgressView()
@@ -123,14 +132,21 @@ struct NewConnectionView: View {
                 }
                 Spacer()
                 Button("Cancel") { dismiss() }
+                    .buttonStyle(.appSecondary)
                     .keyboardShortcut(.cancelAction)
                 Button("Add Connection") { submit() }
+                    .buttonStyle(.appPrimary)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!issues.isEmpty || isSubmitting)
             }
             .padding()
+            .background(AppColors.bgSubtle)
+            .overlay(alignment: .top) {
+                Rectangle().fill(AppColors.border).frame(height: 1)
+            }
         }
-        .frame(width: 480, height: 560)
+        .frame(width: 480, height: 580)
+        .background(AppColors.bgPanel)
     }
 
     // MARK: Validation
@@ -164,6 +180,22 @@ struct NewConnectionView: View {
         case .sqlite:
             if sqlitePath.trimmingCharacters(in: .whitespaces).isEmpty {
                 problems.append("Choose a database file.")
+            }
+        case .bullmq:
+            if host.trimmingCharacters(in: .whitespaces).isEmpty {
+                problems.append("Host is required.")
+            }
+            if let portNumber = Int(port), (1...65535).contains(portNumber) {
+            } else {
+                problems.append("Port must be a number between 1 and 65535.")
+            }
+            let dbText = database.trimmingCharacters(in: .whitespaces)
+            if let dbNumber = Int(dbText.isEmpty ? "0" : dbText), (0...15).contains(dbNumber) {
+            } else {
+                problems.append("Database must be a Redis logical database between 0 and 15.")
+            }
+            if bullPrefix.range(of: #"^[A-Za-z0-9:_-]{1,64}$"#, options: .regularExpression) == nil {
+                problems.append("Key prefix may only contain letters, digits, colons, underscores, and dashes.")
             }
         }
         return problems
@@ -208,6 +240,13 @@ struct NewConnectionView: View {
             input = .sqlite(.init(
                 name: trimmedName, filePath: sqlitePath,
                 environment: environment, readOnly: readOnly))
+        case .bullmq:
+            let dbText = trimmedDatabase.isEmpty ? "0" : trimmedDatabase
+            input = .bullmq(.init(
+                name: trimmedName, host: host, port: Int(port) ?? 6379,
+                password: password, database: Int(dbText) ?? 0,
+                tls: bullTLS, prefix: bullPrefix.trimmingCharacters(in: .whitespaces),
+                environment: environment, readOnly: readOnly))
         }
         isSubmitting = true
         addError = nil
@@ -220,5 +259,53 @@ struct NewConnectionView: View {
                 addError = SessionStore.redactedMessage(for: error)
             }
         }
+    }
+}
+
+
+/// One engine card in the picker grid (reference `.engine-option`): monogram
+/// chip, name, hint; the selected card takes the accent tint.
+private struct EngineOptionCard: View {
+    let engine: DatabaseEngine
+    let isSelected: Bool
+    let select: () -> Void
+
+    private var hint: String {
+        switch engine {
+        case .postgresql: "SQL · server"
+        case .mysql: "SQL · server"
+        case .mongodb: "Documents"
+        case .sqlite: "SQL · local file"
+        case .bullmq: "Redis job queues"
+        }
+    }
+
+    var body: some View {
+        Button(action: select) {
+            HStack(spacing: 10) {
+                EngineBadge(engine: engine)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(engine.displayName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(AppColors.text)
+                    Text(hint)
+                        .font(.system(size: 11))
+                        .foregroundStyle(AppColors.textDisabled)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 9)
+            .frame(minHeight: 58)
+            .background(
+                RoundedRectangle(cornerRadius: AppMetrics.cornerRadius)
+                    .fill(isSelected ? AppColors.accentSoft : AppColors.bgPanel))
+            .overlay(
+                RoundedRectangle(cornerRadius: AppMetrics.cornerRadius)
+                    .stroke(isSelected ? AppColors.accent : AppColors.border, lineWidth: 1))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }

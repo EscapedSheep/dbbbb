@@ -52,8 +52,14 @@ struct ResultsTableView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSScrollView {
         let table = ResultsNSTableView()
-        table.headerView = NSTableHeaderView()
-        table.usesAlternatingRowBackgroundColors = true
+        table.headerView = ResultsTableHeaderView()
+        // The reference grid: flat rows, hairline separators, no zebra.
+        table.usesAlternatingRowBackgroundColors = false
+        table.backgroundColor = NSColor(AppColors.bgPanel)
+        table.gridColor = NSColor(AppColors.border)
+        table.gridStyleMask = [.solidHorizontalGridLineMask, .solidVerticalGridLineMask]
+        table.intercellSpacing = NSSize(width: 1, height: 1)
+        table.rowHeight = 33
         // No column autoresizing: wide tables scroll horizontally instead of
         // squeezing every column into the window.
         table.columnAutoresizingStyle = .noColumnAutoresizing
@@ -123,7 +129,9 @@ struct ResultsTableView: NSViewRepresentable {
         private func syncSortIndicators(in tableView: NSTableView, parent: ResultsTableView) {
             let sort = parent.store.previewedObject != nil ? parent.store.previewSort : nil
             for (index, column) in tableView.tableColumns.enumerated() {
-                let active = index < parent.columns.count && sort?.column == parent.columns[index].name
+                let dataIndex = index - 1
+                let active = dataIndex >= 0 && dataIndex < parent.columns.count
+                    && sort?.column == parent.columns[dataIndex].name
                 let image: NSImage? = active
                     ? NSImage(
                         systemSymbolName: sort?.ascending == true ? "chevron.up" : "chevron.down",
@@ -164,14 +172,8 @@ struct ResultsTableView: NSViewRepresentable {
         // MARK: NSTableViewDelegate
 
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-            guard let parent, let tableColumn,
-                  let index = tableView.tableColumns.firstIndex(of: tableColumn),
-                  parent.rows.indices.contains(row), index < parent.columns.count
-            else { return nil }
-            let model = parent.rows[row]
-            let column = parent.columns[index]
-            let text = index < model.cells.count ? model.cells[index] : ""
-            let isNull = index < model.values.count && model.values[index] == .null
+            guard let parent, let tableColumn else { return nil }
+            let index = tableView.tableColumns.firstIndex(of: tableColumn) ?? 0
 
             let cell: NSTextField
             if let reused = tableView.makeView(withIdentifier: cellIdentifier, owner: nil) as? NSTextField {
@@ -182,16 +184,39 @@ struct ResultsTableView: NSViewRepresentable {
                 cell.lineBreakMode = .byTruncatingTail
                 cell.maximumNumberOfLines = 1
             }
-            cell.stringValue = text
+            cell.font = AppFonts.mono(12)
+
+            if index == 0 {
+                // Row number (1-based, reference `.row-index`).
+                cell.stringValue = String(row + 1)
+                cell.textColor = NSColor(AppColors.textDisabled)
+                cell.alignment = .right
+                cell.toolTip = nil
+                return cell
+            }
+
+            let dataIndex = index - 1
+            guard parent.rows.indices.contains(row), dataIndex < parent.columns.count else { return nil }
+            let model = parent.rows[row]
+            let column = parent.columns[dataIndex]
+            let text = dataIndex < model.cells.count ? model.cells[dataIndex] : ""
+            let isNull = dataIndex < model.values.count && model.values[dataIndex] == .null
+            // NULL renders as an italic "NULL" marker (reference `.null-cell`).
+            cell.stringValue = isNull ? "NULL" : text
             // Full value on hover, mirroring the SwiftUI cell's `.help(text)`.
             cell.toolTip = text
-            cell.font = column.numeric
-                ? .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-                : .systemFont(ofSize: NSFont.systemFontSize)
-            // `labelColor`/`tertiaryLabelColor` follow dark/light automatically.
-            cell.textColor = isNull ? .tertiaryLabelColor : .labelColor
+            cell.textColor = NSColor(AppColors.text)
+            if isNull {
+                cell.font = NSFontManager.shared.convert(cell.font!, toHaveTrait: .italicFontMask)
+                cell.textColor = NSColor(AppColors.textDisabled)
+            }
             cell.alignment = column.numeric ? .right : .left
             return cell
+        }
+
+        /// Reference selection color (bg-selected) instead of the system blue.
+        func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+            ResultsTableRowView()
         }
 
         func tableViewSelectionDidChange(_ notification: Notification) {
@@ -209,11 +234,11 @@ struct ResultsTableView: NSViewRepresentable {
         /// nothing.
         func tableView(_ tableView: NSTableView, didClick tableColumn: NSTableColumn) {
             guard let parent,
-                  let index = tableView.tableColumns.firstIndex(of: tableColumn),
-                  index < parent.columns.count,
+                  let rawIndex = tableView.tableColumns.firstIndex(of: tableColumn),
+                  rawIndex > 0, rawIndex - 1 < parent.columns.count,
                   parent.store.previewedObject != nil
             else { return }
-            let column = parent.columns[index].name
+            let column = parent.columns[rawIndex - 1].name
             let current = parent.store.previewSort
             if current?.column != column {
                 parent.store.setPreviewSort(PreviewRequest.Sort(column: column, ascending: true))
@@ -338,5 +363,23 @@ private final class ForeignKeyJumpBox {
     init(foreignKey: ForeignKey, row: [(key: String, value: DisplayValue)]) {
         self.foreignKey = foreignKey
         self.row = row
+    }
+}
+
+
+/// Reference `bg-selected` row highlight.
+private final class ResultsTableRowView: NSTableRowView {
+    override func drawSelection(in dirtyRect: NSRect) {
+        NSColor(AppColors.bgSelected).setFill()
+        dirtyRect.fill()
+    }
+}
+
+/// Header strip background (reference `.result-table th` = bg-subtle).
+final class ResultsTableHeaderView: NSTableHeaderView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(AppColors.bgSubtle).setFill()
+        dirtyRect.fill()
+        super.draw(dirtyRect)
     }
 }

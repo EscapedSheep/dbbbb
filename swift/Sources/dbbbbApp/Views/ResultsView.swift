@@ -1,47 +1,185 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import dbbbbCore
 import dbbbbKit
 
-/// Result area: progress while running, a grid for rows, tree for documents.
-/// While a preview is shown, a filter/sort bar sits on top (ROADMAP M1 ②).
+/// Result area: a 36px toolbar (Results title, count, scan/elapsed meta,
+/// truncation badge, Continue scan, Export), then the content — progress while
+/// running, a grid for rows, tree for documents. While a preview is shown, a
+/// filter/sort bar sits on top (ROADMAP M1 ②).
 struct ResultsView: View {
     @Environment(SessionStore.self) private var store
 
     var body: some View {
-        if store.isExecuting {
-            VStack(spacing: 12) {
-                ProgressView()
-                    .controlSize(.large)
-                Text("Running…")
-                    .foregroundStyle(.secondary)
-                Button("Cancel") { store.cancelQuery() }
-                    .keyboardShortcut(".", modifiers: .command)
+        VStack(spacing: 0) {
+            resultToolbar
+            if store.isExecuting {
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.large)
+                    Text("Running…")
+                        .foregroundStyle(AppColors.textSecondary)
+                    Button("Cancel") { store.cancelQuery() }
+                        .buttonStyle(.appSecondary)
+                        .keyboardShortcut(".", modifiers: .command)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let result = store.result {
+                VStack(spacing: 0) {
+                    if store.previewedObject != nil {
+                        PreviewFilterBar(result: result)
+                        Divider().overlay(AppColors.border)
+                    }
+                    if !store.pendingChanges.isEmpty {
+                        PendingChangesBar()
+                        Divider().overlay(AppColors.border)
+                    }
+                    switch result {
+                    case .rows(let columns, let rows, _):
+                        RowsTableView(columns: columns, rows: rows)
+                    case .documents(let documents, _):
+                        DocumentTreeView(documents: documents)
+                    }
+                }
+            } else {
+                ResultsEmptyView()
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let result = store.result {
-            VStack(spacing: 0) {
-                if store.previewedObject != nil {
-                    PreviewFilterBar(result: result)
-                    Divider()
-                }
-                if !store.pendingChanges.isEmpty {
-                    PendingChangesBar()
-                    Divider()
-                }
-                switch result {
-                case .rows(let columns, let rows, _):
-                    RowsTableView(columns: columns, rows: rows)
-                case .documents(let documents, _):
-                    DocumentTreeView(documents: documents)
-                }
-            }
-        } else {
-            ContentUnavailableView(
-                "No Results",
-                systemImage: "play.rectangle",
-                description: Text("Write a query and press ⌘Return to run it.")
-            )
         }
+    }
+
+    /// Reference `.result-toolbar`: title + count on the left, meta and
+    /// actions on the right, subtle background.
+    private var resultToolbar: some View {
+        HStack(spacing: 7) {
+            Image(systemName: store.resultIsDocuments ? "curlybraces" : "tablecells")
+                .font(.system(size: 11))
+                .foregroundStyle(AppColors.textSecondary)
+            Text("Results")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(AppColors.text)
+            if let meta = store.result?.meta {
+                Text("\(meta.count) \(store.resultIsDocuments ? "documents" : "rows")")
+                    .font(.system(size: 11))
+                    .foregroundStyle(AppColors.textDisabled)
+            }
+            Spacer()
+            if let meta = store.result?.meta {
+                if store.selectedSession?.profile.engine == .bullmq, let scanned = meta.scanned {
+                    Text("Scanned \(scanned.formatted())"
+                        + (meta.total.map { " of \($0.formatted())" } ?? ""))
+                        .font(.system(size: 11))
+                        .monospacedDigit()
+                        .foregroundStyle(AppColors.textDisabled)
+                        .help("Index entries examined for this result")
+                }
+                Text("\(meta.elapsedMilliseconds) ms")
+                    .font(.system(size: 11))
+                    .monospacedDigit()
+                    .foregroundStyle(AppColors.textDisabled)
+                if meta.truncated {
+                    Text("Truncated")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(AppColors.warning)
+                        .padding(.horizontal, 7)
+                        .frame(height: 20)
+                        .background(Capsule().fill(AppColors.warningSoft))
+                        .overlay(Capsule().stroke(AppColors.warning.opacity(0.3), lineWidth: 1))
+                        .help("The result was capped; refine the query or continue the scan to see more.")
+                }
+                if store.canContinueScan {
+                    Button {
+                        store.continueScan()
+                    } label: {
+                        Label("Continue scan", systemImage: "forward.fill")
+                    }
+                    .buttonStyle(.appSecondaryCompact)
+                    .help("Resume the scan from \(meta.nextCursor ?? 0) and append the next page")
+                }
+                exportControl
+            }
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 9)
+        .frame(height: AppMetrics.resultToolbarHeight)
+        .background(AppColors.bgSubtle)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(AppColors.border).frame(height: 1)
+        }
+    }
+
+    /// Export affordance: document results offer only JSONL (one button); row
+    /// results offer CSV, plus INSERT statements when the target table is
+    /// known (previews only) — a small menu keeps the bar uncluttered.
+    @ViewBuilder
+    private var exportControl: some View {
+        if store.canExportResult {
+            if store.resultIsDocuments {
+                Button {
+                    exportResult(fileExtension: "jsonl", title: "Export result as JSON Lines")
+                } label: {
+                    Label("Export…", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.appSecondaryCompact)
+                .help("Export the visible result as JSON Lines")
+            } else {
+                Menu {
+                    Button("Export as CSV…") {
+                        exportResult(fileExtension: "csv", title: "Export result as CSV")
+                    }
+                    if let table = store.insertExportTable {
+                        Button("Export as INSERT Statements…") {
+                            exportResult(
+                                fileExtension: "sql",
+                                title: "Export result as INSERT statements",
+                                format: .insertStatements(table: table))
+                        }
+                    }
+                } label: {
+                    Label("Export…", systemImage: "square.and.arrow.up")
+                }
+                .menuIndicator(.hidden)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .font(.system(size: 11, weight: .medium))
+                .help("Export the visible result")
+            }
+        }
+    }
+
+    /// Save-panel export of the visible (already capped) result.
+    private func exportResult(
+        fileExtension: String,
+        title: String,
+        format: ResultExporter.Format = .automatic
+    ) {
+        let panel = NSSavePanel()
+        panel.title = title
+        panel.nameFieldStringValue = "\(store.suggestedExportBaseName()).\(fileExtension)"
+        if let type = UTType(filenameExtension: fileExtension) {
+            panel.allowedContentTypes = [type]
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        store.exportResult(to: url, format: format)
+    }
+}
+
+/// The zero-result state (reference `.result-empty`).
+private struct ResultsEmptyView: View {
+    var body: some View {
+        VStack(spacing: 0) {
+            Image(systemName: "play.rectangle")
+                .font(.system(size: 22))
+                .foregroundStyle(AppColors.textDisabled)
+            Text("No results yet")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AppColors.textSecondary)
+                .padding(.top, 8)
+            Text("Write a query and press ⌘Return to run it.")
+                .font(.system(size: 12))
+                .foregroundStyle(AppColors.textDisabled)
+                .padding(.top, 3)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -83,7 +221,7 @@ struct PreviewFilterBar: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "line.3.horizontal.decrease")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(AppColors.textSecondary)
             Picker("Column", selection: filterColumnBinding) {
                 ForEach(columnNames, id: \.self) { name in
                     Text(name).tag(name)
@@ -106,7 +244,7 @@ struct PreviewFilterBar: View {
                     Image(systemName: "xmark.circle.fill")
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(AppColors.textSecondary)
                 .help("Clear the filter")
             }
 
@@ -114,7 +252,7 @@ struct PreviewFilterBar: View {
                 .frame(height: 14)
 
             Image(systemName: "arrow.up.arrow.down")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(AppColors.textSecondary)
             Picker("Sort", selection: sortColumnBinding) {
                 Text("Unsorted").tag("")
                 ForEach(columnNames, id: \.self) { name in
@@ -135,9 +273,11 @@ struct PreviewFilterBar: View {
 
             Spacer()
         }
-        .font(.caption)
+        .font(.system(size: 11))
+        .foregroundStyle(AppColors.textSecondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .background(AppColors.bgPanel)
         // A fresh preview (or an object switch) resets the input to the
         // store's state of record.
         .onChange(of: store.previewedObject) {
