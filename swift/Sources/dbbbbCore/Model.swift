@@ -2,7 +2,7 @@ import Foundation
 
 /// Supported database engines.
 public enum DatabaseEngine: String, Codable, Sendable, CaseIterable {
-    case postgresql, mysql, mongodb, sqlite
+    case postgresql, mysql, mongodb, sqlite, bullmq
 
     public var displayName: String {
         switch self {
@@ -10,11 +10,17 @@ public enum DatabaseEngine: String, Codable, Sendable, CaseIterable {
         case .mysql: "MySQL"
         case .mongodb: "MongoDB"
         case .sqlite: "SQLite"
+        case .bullmq: "BullMQ"
         }
     }
 
     /// SQL-family engines share the text-command model.
-    public var isSQLFamily: Bool { self != .mongodb }
+    public var isSQLFamily: Bool {
+        switch self {
+        case .postgresql, .mysql, .sqlite: true
+        case .mongodb, .bullmq: false
+        }
+    }
 }
 
 /// Deployment environment tag shown in the UI; production requires extra confirmation for writes.
@@ -34,6 +40,7 @@ public enum ConnectionInput: Codable, Sendable {
     case mysql(MySQLInput)
     case mongo(MongoInput)
     case sqlite(SQLiteInput)
+    case bullmq(BullmqInput)
 
     public struct PostgresInput: Codable, Sendable {
         public var name: String
@@ -90,12 +97,33 @@ public enum ConnectionInput: Codable, Sendable {
         }
     }
 
+    public struct BullmqInput: Codable, Sendable {
+        public var name: String
+        public var host: String
+        public var port: Int
+        /// Optional Redis AUTH password; persisted only through the Keychain.
+        public var password: String
+        /// Redis logical database index (0...15).
+        public var database: Int
+        public var tls: Bool
+        /// BullMQ key prefix; jobs live under `<prefix>:<queue>:…`.
+        public var prefix: String
+        public var environment: ConnectionEnvironment
+        public var readOnly: Bool
+        public init(name: String, host: String, port: Int = 6379, password: String = "", database: Int = 0, tls: Bool = false, prefix: String = "bull", environment: ConnectionEnvironment = .development, readOnly: Bool = false) {
+            self.name = name; self.host = host; self.port = port; self.password = password
+            self.database = database; self.tls = tls; self.prefix = prefix
+            self.environment = environment; self.readOnly = readOnly
+        }
+    }
+
     public var engine: DatabaseEngine {
         switch self {
         case .postgres: .postgresql
         case .mysql: .mysql
         case .mongo: .mongodb
         case .sqlite: .sqlite
+        case .bullmq: .bullmq
         }
     }
 
@@ -105,6 +133,7 @@ public enum ConnectionInput: Codable, Sendable {
         case .mysql(let i): i.name
         case .mongo(let i): i.name
         case .sqlite(let i): i.name
+        case .bullmq(let i): i.name
         }
     }
 
@@ -114,6 +143,7 @@ public enum ConnectionInput: Codable, Sendable {
         case .mysql(let i): i.database
         case .mongo(let i): i.database
         case .sqlite(let i): (i.filePath as NSString).lastPathComponent
+        case .bullmq(let i): String(i.database)
         }
     }
 
@@ -123,6 +153,7 @@ public enum ConnectionInput: Codable, Sendable {
         case .mysql(let i): i.environment
         case .mongo(let i): i.environment
         case .sqlite(let i): i.environment
+        case .bullmq(let i): i.environment
         }
     }
 
@@ -132,6 +163,7 @@ public enum ConnectionInput: Codable, Sendable {
         case .mysql(let i): i.readOnly
         case .mongo(let i): i.readOnly
         case .sqlite(let i): i.readOnly
+        case .bullmq(let i): i.readOnly
         }
     }
 
@@ -142,6 +174,7 @@ public enum ConnectionInput: Codable, Sendable {
         case .mysql(let i): "\(i.host):\(i.port)"
         case .mongo(let i): Self.redactMongoURI(i.uri)
         case .sqlite(let i): i.filePath
+        case .bullmq(let i): "\(i.host):\(i.port)"
         }
     }
 
@@ -257,25 +290,31 @@ public struct DatabaseObject: Identifiable, Codable, Sendable, Hashable {
     public let parentID: String?
     public let name: String
     public let kind: DatabaseObjectKind
-    public init(id: String, parentID: String?, name: String, kind: DatabaseObjectKind) {
-        self.id = id; self.parentID = parentID; self.name = name; self.kind = kind
+    /// Optional one-line annotation (BullMQ state nodes carry the job count,
+    /// e.g. "3 jobs"); engines without a detail leave it nil.
+    public let detail: String?
+    public init(id: String, parentID: String?, name: String, kind: DatabaseObjectKind, detail: String? = nil) {
+        self.id = id; self.parentID = parentID; self.name = name; self.kind = kind; self.detail = detail
     }
 }
 
 /// Commands accepted by adapters. SQL-family engines share `.sql`;
 /// MongoDB accepts canonical Extended JSON only — never evaluated code.
 /// Mongo commands carry the target collection explicitly; the editor text
-/// stays pure Extended JSON.
+/// stays pure Extended JSON. BullMQ accepts one JSON job-query document
+/// (`BullmqJobQuery`) — the queue and state live inside the text.
 public enum DatabaseCommand: Codable, Sendable, Equatable {
     case sql(String)
     case mongoFind(collection: String, filter: String)
     case mongoAggregate(collection: String, pipeline: String)
+    case bullmqJobs(String)
 
     public var text: String {
         switch self {
         case .sql(let text): text
         case .mongoFind(_, let filter): filter
         case .mongoAggregate(_, let pipeline): pipeline
+        case .bullmqJobs(let text): text
         }
     }
 }
@@ -451,8 +490,15 @@ public struct ResultMeta: Codable, Sendable, Equatable {
     public let count: Int
     public let truncated: Bool
     public let elapsedMilliseconds: Int
-    public init(count: Int, truncated: Bool, elapsedMilliseconds: Int) {
+    /// Index entries examined while producing this page (BullMQ scans).
+    public let scanned: Int?
+    /// Server-side size of the queried index/result set (BullMQ state index).
+    public let total: Int?
+    /// Resume offset for the next page of a truncated scan (BullMQ).
+    public let nextCursor: Int?
+    public init(count: Int, truncated: Bool, elapsedMilliseconds: Int, scanned: Int? = nil, total: Int? = nil, nextCursor: Int? = nil) {
         self.count = count; self.truncated = truncated; self.elapsedMilliseconds = elapsedMilliseconds
+        self.scanned = scanned; self.total = total; self.nextCursor = nextCursor
     }
 }
 

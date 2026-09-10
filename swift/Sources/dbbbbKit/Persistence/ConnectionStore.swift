@@ -34,6 +34,9 @@ public struct PersistedConnection: Codable, Sendable, Equatable {
     public var tls: Bool?
     // SQLite
     public var filePath: String?
+    // BullMQ (host/port/tls are shared with the SQL engines above; the Redis
+    // logical database index rides in `database` as its decimal text)
+    public var prefix: String?
 
     public init(id: UUID, input: ConnectionInput) {
         self.id = id
@@ -51,6 +54,9 @@ public struct PersistedConnection: Codable, Sendable, Equatable {
             tls = input.tls
         case .sqlite(let input):
             filePath = input.filePath
+        case .bullmq(let input):
+            host = input.host; port = input.port; tls = input.tls
+            prefix = input.prefix
         }
     }
 
@@ -61,6 +67,7 @@ public struct PersistedConnection: Codable, Sendable, Equatable {
         case .mysql(let input): input.password
         case .mongo(let input): input.uri
         case .sqlite: nil
+        case .bullmq(let input): input.password.isEmpty ? nil : input.password
         }
     }
 
@@ -90,6 +97,14 @@ public struct PersistedConnection: Codable, Sendable, Equatable {
             guard let filePath else { throw PersistenceError.corruptRecord }
             return .sqlite(.init(
                 name: name, filePath: filePath,
+                environment: environment, readOnly: readOnly))
+        case .bullmq:
+            guard let host, let port, let tls, let prefix, let db = Int(database) else {
+                throw PersistenceError.corruptRecord
+            }
+            return .bullmq(.init(
+                name: name, host: host, port: port, password: secret ?? "",
+                database: db, tls: tls, prefix: prefix,
                 environment: environment, readOnly: readOnly))
         }
     }

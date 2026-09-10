@@ -184,7 +184,7 @@ public final class MongoAdapter: DatabaseAdapter, Sendable {
             kind = .find; text = filter; collection = target
         case .mongoAggregate(let target, let pipeline):
             kind = .aggregate; text = pipeline; collection = target
-        case .sql: throw AdapterError.engineMismatch
+        case .sql, .bullmqJobs: throw AdapterError.engineMismatch
         }
         guard !collection.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MongoAdapterError.noCollectionSelected

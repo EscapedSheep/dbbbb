@@ -17,7 +17,7 @@ public enum ExplainPlanner {
             return "EXPLAIN " + query
         case .sqlite:
             return "EXPLAIN QUERY PLAN " + query
-        case .mongodb:
+        case .mongodb, .bullmq:
             return nil
         }
     }

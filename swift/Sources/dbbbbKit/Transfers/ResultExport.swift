@@ -266,9 +266,9 @@ public enum InsertStatementRenderer {
         case .sqlite:
             // SQLite previews quote the bare name (single-file databases).
             return [object.name]
-        case .mongodb:
-            // MongoDB results are documents, never rows; the bare name keeps
-            // this switch total without implying INSERT support.
+        case .mongodb, .bullmq:
+            // Document/queue results are documents, never rows; the bare name
+            // keeps this switch total without implying INSERT support.
             return [object.name]
         }
     }

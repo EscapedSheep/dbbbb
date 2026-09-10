@@ -28,8 +28,9 @@ public enum SelectStatementBuilder {
             return "select * from \(MySQLAdapter.quoteIdentifier(object.name)) limit 100;"
         case .sqlite:
             return "select * from \(SQLiteAdapter.quoteIdentifier(object.name)) limit 100;"
-        case .mongodb:
-            // MongoDB has no SELECT; SessionStore runs the find template.
+        case .mongodb, .bullmq:
+            // No SELECT for document/queue engines; SessionStore runs the
+            // engine's own template.
             throw AdapterError.engineMismatch
         }
     }
