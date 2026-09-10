@@ -5,13 +5,13 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-dbbbb is a local-first, open-source macOS database client for PostgreSQL, MySQL, MongoDB, and SQLite. It is a native Swift 6 application built with SwiftUI and SwiftPM, requiring macOS 15 or later. The goal: open a connection, locate data, and make safe, deliberate changes without the visual weight of a full database administration suite.
+dbbbb is a local-first, open-source macOS database client for PostgreSQL, MySQL, MongoDB, SQLite, and BullMQ (Redis job queues). It is a native Swift 6 application built with SwiftUI and SwiftPM, requiring macOS 15 or later. The goal: open a connection, locate data, and make safe, deliberate changes without the visual weight of a full database administration suite.
 
-> **Note:** the repository also contains `src/`, the deprecated first-generation Electron implementation. It is kept for historical reference only and is no longer developed. The current product lives entirely under `swift/`.
+> **Note:** the deprecated first-generation Electron implementation was removed from the repository (`src/` is gone; see the git history). The product lives entirely under `swift/`.
 
 ## What works now
 
-- Real connections to all four engines. PostgreSQL, MySQL support `disable`, `require`, and `verify-full` SSL modes; MongoDB supports SRV URIs with TLS enforced. SQLite opens local database files, optionally read-only.
+- Real connections to all five engines. PostgreSQL, MySQL support `disable`, `require`, and `verify-full` SSL modes; MongoDB supports SRV URIs with TLS enforced. SQLite opens local database files, optionally read-only.
 - Object browsing, generated previews, and query execution with bounded results (500 rows / 5 MiB per result, 8 MiB per single value with an explicit truncation marker), targeted cancellation, and redacted error messages that never leak passwords, URIs, or local paths. Double-click a table or view to run its `SELECT … LIMIT 100` instantly (a MongoDB collection runs its find).
 - View Create Statement for tables and views on PostgreSQL, MySQL, and SQLite: the DDL opens read-only in a monospaced, copyable sheet (a fail-closed capability — MongoDB and unsupported adapters never show it).
 - Preview paging and grid filtering/sorting: page through large tables (100 rows per page), click column headers to cycle sort, and filter any column by substring or exact match — server-side and parameterized on the SQL engines, native sort/regex on MongoDB.
@@ -32,7 +32,8 @@ dbbbb is a local-first, open-source macOS database client for PostgreSQL, MySQL,
 - Precision-safe display: bigints, decimals, non-finite numbers, and dates are always rendered as strings; MongoDB results round-trip through canonical Extended JSON with Decimal128 bit-level fidelity.
 - Opt-in saved connections: the connection list lives under `~/Library/Application Support/dbbbb` with restrictive permissions, while passwords and credential-bearing MongoDB URIs are stored only in the macOS Keychain. Saved connections reconnect automatically at startup; reconnect failures surface a redacted banner and never drop the saved entry.
 - A local query history and favorites library (bounded, credentials never persisted).
-- Light, Dark, and System themes.
+- BullMQ (Redis) job queues, read-only by construction: browse all eight job states — including `paused` and `waiting-children`, which BullMQ's own `getJobs` cannot read — query jobs as JSON documents (state, time range, name glob, `where` on data dot paths, `includeLogs` for the bounded log tail), page huge queues safely with a scan budget plus cursor-based Continue scan, and fetch each page server-side with a single Lua script. **Sync to local SQL** materializes a queue into a local read-only SQLite table (full SQL, `json_extract` included); snapshots are session-scoped files, swept at startup and deleted on exit. Redis is never modified.
+- A calm, dense UI redesigned after the original Electron shell: single-column sidebar (connections + object tree + search), tab strip, monospaced query editor with a line-number gutter, and a full design-token layer with Light, Dark, and System themes.
 
 ## Run locally
 
@@ -56,7 +57,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 
 The `DEVELOPER_DIR` prefix is only needed when `xcode-select` points at the Command Line Tools, which ship no XCTest; if an Xcode is already selected, plain `swift test` works. Build warnings are treated as errors by project discipline — keep `swift build` warning-free.
 
-Integration tests skip automatically unless a server URL is provided via `DBBBB_TEST_POSTGRES_URL`, `DBBBB_TEST_MYSQL_URL`, or `DBBBB_TEST_MONGO_URL`, so the default suite needs no live database.
+Integration tests skip automatically unless a server URL is provided via `DBBBB_TEST_POSTGRES_URL`, `DBBBB_TEST_MYSQL_URL`, `DBBBB_TEST_MONGO_URL`, or `DBBBB_TEST_REDIS_URL` (BullMQ, e.g. `redis://127.0.0.1:6379`; fixture data is confined to logical database 15 under a dedicated key prefix), so the default suite needs no live database.
 
 ## Package
 
@@ -68,8 +69,8 @@ This produces an ad-hoc-signed `swift/release/dbbbb.app` and `swift/release/dbbb
 
 ## Repository layout
 
-- `swift/` — the current product: `dbbbbCore` (type contracts), `dbbbbKit` (engine adapters, persistence, transfers), `dbbbbApp` (SwiftUI shell), plus tests and the packaging script.
-- `src/`, `docs/`, `package.json` — the deprecated Electron implementation and its documentation, kept for historical reference only.
+- `swift/` — the current product: `dbbbbCore` (type contracts), `dbbbbKit` (engine adapters, the hand-rolled RESP client and BullMQ adapter under `Redis/` + `BullMQ/`, persistence, transfers), `dbbbbApp` (SwiftUI shell), plus tests and the packaging script.
+- `docs/` — the development roadmap. The deprecated Electron implementation and its documentation were removed; see the git history.
 - `HANDOVER.md` — current project status and handover notes.
 
 ## License
