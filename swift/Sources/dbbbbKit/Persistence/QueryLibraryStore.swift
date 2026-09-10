@@ -180,7 +180,14 @@ public final class QueryLibraryStore: @unchecked Sendable {
         let firstLine = text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first
             .map { $0.split(whereSeparator: { $0 == " " || $0 == "\t" }).joined(separator: " ") } ?? ""
         let base: String
-        if !firstLine.isEmpty {
+        if engine == .bullmq {
+            // Job queries are multi-line JSON; "queue · state" beats "{".
+            if let pair = BullmqQueryText.queueAndState(of: text) {
+                base = "\(pair.queue) · \(pair.state)"
+            } else {
+                base = "BullMQ jobs"
+            }
+        } else if !firstLine.isEmpty {
             base = firstLine
         } else if engine == .mongodb, let collection {
             base = "\(collection) find"

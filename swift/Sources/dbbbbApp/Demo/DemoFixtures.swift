@@ -29,8 +29,13 @@ struct DemoFixture: Sendable {
         case .mysql: mysql
         case .mongodb: mongo
         case .sqlite: sqlite
+        case .bullmq: empty
         }
     }
+
+    /// BullMQ demo sessions never read a fixture — they delegate to a real
+    /// `BullmqAdapter` over the in-memory `DemoRedisClient` (see DemoAdapter).
+    static let empty = DemoFixture(objects: [], tables: [], collections: [], activities: [])
 
     // MARK: PostgreSQL — a "warehouse" database with users/orders.
 

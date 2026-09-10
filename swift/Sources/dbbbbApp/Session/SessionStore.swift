@@ -54,7 +54,7 @@ final class SessionStore {
         case aggregate
     }
 
-    /// Builds an adapter for a newly added connection. The four demo connections
+    /// Builds an adapter for a newly added connection. The demo connections
     /// are seeded at launch with `DemoAdapter` and never go through this factory.
     var makeAdapter: @Sendable (ConnectionInput) async throws -> any DatabaseAdapter = { input in
         switch input {
@@ -62,6 +62,7 @@ final class SessionStore {
         case .mysql(let input): try MySQLAdapter(input: input)
         case .mongo(let input): try await MongoAdapter(input: input)
         case .sqlite(let input): try SQLiteAdapter(input: input)
+        case .bullmq(let input): try BullmqAdapter(input: input)
         }
     }
 
@@ -158,9 +159,14 @@ final class SessionStore {
     }
 
     init(connectionStore: ConnectionStore? = ConnectionStore(),
-         queryLibrary: QueryLibraryStore? = QueryLibraryStore()) {
+         queryLibrary: QueryLibraryStore? = QueryLibraryStore(),
+         snapshotStore: BullmqSnapshotStore? = nil) {
         self.connectionStore = connectionStore
         self.queryLibrary = queryLibrary
+        self.snapshotStore = snapshotStore
+        // Startup sweep: snapshots never outlive their session, so anything
+        // left in the directory is a leftover from a previous run.
+        if let snapshotStore { try? snapshotStore.sweepManagedFiles() }
         queryEntries = queryLibrary?.entries ?? []
         selectedTabID = tabs[0].id
         sessions = DemoAdapter.demoSessions().map { Session(profile: $0.profile, adapter: $0) }
@@ -416,8 +422,11 @@ final class SessionStore {
             isLoadingObjects = false
             selectConnection(sessions.first?.id)
         }
-        // Demo connections never touch disk or the Keychain.
-        if !session.profile.demo, let connectionStore {
+        // Snapshot sessions delete their backing file and never touch the
+        // manifest; demo connections never touch disk or the Keychain.
+        if let file = snapshotFiles.removeValue(forKey: id) {
+            snapshotStore?.deleteSnapshot(at: file)
+        } else if !session.profile.demo, let connectionStore {
             do {
                 try connectionStore.remove(id: id)
             } catch {
@@ -428,10 +437,16 @@ final class SessionStore {
     }
 
     static func defaultQuery(for engine: DatabaseEngine, objects: [DatabaseObject]) -> String {
-        let firstLeaf = objects.first { $0.kind == .table || $0.kind == .collection }
         if engine == .mongodb {
             return "{ }"
         }
+        if engine == .bullmq {
+            // The reference's DEFAULT_QUERY: a failed-jobs example. The first
+            // discovered queue fills in for the placeholder name.
+            let queue = objects.first { $0.kind == .collection }?.name ?? "emails"
+            return "{\n  \"queue\": \"\(queue)\",\n  \"state\": \"failed\",\n  \"limit\": 100\n}"
+        }
+        let firstLeaf = objects.first { $0.kind == .table || $0.kind == .collection }
         if let firstLeaf,
            let statement = try? SelectStatementBuilder.selectLimit100(engine: engine, object: firstLeaf) {
             return statement
@@ -447,6 +462,18 @@ final class SessionStore {
         if session.profile.engine == .mongodb {
             mongoQueryMode = .find
             queryText = "{ }"
+        } else if session.profile.engine == .bullmq {
+            // Node ids are `<queue>` or `<queue>:<state>`; the state tail is
+            // matched against the known state names so colon-named queues
+            // resolve to their queue. Queue nodes preview the failed state.
+            var queue = object.id
+            var state = "failed"
+            if object.kind == .table,
+               let jobState = BullmqJobState.allCases.first(where: { object.id.hasSuffix(":\($0.rawValue)") }) {
+                queue = String(object.id.dropLast(jobState.rawValue.count + 1))
+                state = jobState.rawValue
+            }
+            queryText = "{\n  \"queue\": \"\(queue)\",\n  \"state\": \"\(state)\",\n  \"limit\": 100\n}"
         } else {
             queryText = Self.selectStatement(for: object, engine: session.profile.engine)
         }
@@ -455,11 +482,13 @@ final class SessionStore {
     /// Double-click on a leaf: load its SELECT into the editor and run it
     /// immediately. SQL text comes from `SelectStatementBuilder` (the same
     /// identifier quoting as previews); a MongoDB collection runs the find
-    /// template against it.
+    /// template against it; a BullMQ queue/state node runs its jobs query.
     func runSelectLimit100(for object: DatabaseObject) {
         guard let session = selectedSession, !isExecuting else { return }
         if session.profile.engine == .mongodb {
             guard object.kind == .collection else { return }
+        } else if session.profile.engine == .bullmq {
+            guard object.kind == .collection || object.kind == .table else { return }
         } else {
             guard object.kind == .table || object.kind == .view else { return }
         }
@@ -715,6 +744,10 @@ final class SessionStore {
             case .aggregate:
                 command = .mongoAggregate(collection: object.name, pipeline: text)
             }
+        } else if session.profile.engine == .bullmq {
+            // The queue and state live inside the JSON text; no object needs
+            // to be selected (unlike MongoDB's collection-scoped commands).
+            command = .bullmqJobs(text)
         } else {
             command = .sql(text)
         }
@@ -782,11 +815,13 @@ final class SessionStore {
     // MARK: Explain (ROADMAP M2 ⑧)
 
     /// The Explain affordance: there is query text and, for MongoDB, a
-    /// collection is selected (the same gate as Run).
+    /// collection is selected (the same gate as Run). BullMQ has no plan API
+    /// and fails closed here.
     var canExplainQuery: Bool {
         guard let session = selectedSession, !isExecuting,
               !queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return false }
+        if session.profile.engine == .bullmq { return false }
         if session.profile.engine == .mongodb {
             return selectedObject?.kind == .collection
         }
@@ -1252,6 +1287,8 @@ final class SessionStore {
             return object.kind == .table ? .csv : nil
         case .mongodb:
             return object.kind == .collection ? .jsonl : nil
+        case .bullmq:
+            return nil
         }
     }
 
@@ -1604,6 +1641,212 @@ final class SessionStore {
         }
     }
 
+    // MARK: - BullMQ scan continuation
+
+    /// Whether Continue scan applies: a truncated BullMQ document result with
+    /// a resume cursor, not executing, and not a preview (previews page via
+    /// the pager). Mirrors the Electron reference's `canContinueScan`.
+    var canContinueScan: Bool {
+        guard let session = selectedSession,
+              session.profile.engine == .bullmq,
+              !isExecuting,
+              previewedObject == nil,
+              case .documents = result,
+              let meta = result?.meta,
+              meta.truncated, meta.nextCursor != nil
+        else { return false }
+        return true
+    }
+
+    /// Resumes a truncated BullMQ scan: the current query JSON keeps its
+    /// filters, only the cursor moves to the returned nextCursor, and the new
+    /// page is appended to the documents already on screen. The editor text
+    /// itself is left untouched so a fresh Run still starts from the top.
+    func continueScan() {
+        guard canContinueScan,
+              let session = selectedSession,
+              let current = result,
+              case .documents(let existing, let currentMeta) = current,
+              let nextCursor = currentMeta.nextCursor
+        else { return }
+        guard let text = BullmqQueryText.settingCursor(nextCursor, in: queryText) else {
+            errorMessage = "The BullMQ query is not valid JSON; fix it before continuing the scan."
+            return
+        }
+        let command = DatabaseCommand.bullmqJobs(text)
+        let tab = activeTab
+        errorMessage = nil
+        tab.isExecuting = true
+        let connectionID = session.id
+        let adapter = session.adapter
+        let options = ExecuteOptions()
+        let requestID = options.requestID
+        tab.activeRequestID = requestID
+        tab.executionTask = Task { @MainActor in
+            defer { finishExecution(on: tab, for: requestID) }
+            do {
+                let executed = try await adapter.execute(command, options: options)
+                // Ignore stale completions after the user switched connections
+                // or the tab started a newer execution.
+                guard selectedConnectionID == connectionID, tab.activeRequestID == requestID else { return }
+                guard case .documents(let pageDocuments, let pageMeta) = executed else { return }
+                // Merge: documents append; count/scanned/elapsed accumulate;
+                // truncated/total/nextCursor come from the newest page.
+                tab.result = .documents(existing + pageDocuments, meta: ResultMeta(
+                    count: currentMeta.count + pageMeta.count,
+                    truncated: pageMeta.truncated,
+                    elapsedMilliseconds: currentMeta.elapsedMilliseconds + pageMeta.elapsedMilliseconds,
+                    scanned: (currentMeta.scanned ?? 0) + (pageMeta.scanned ?? 0),
+                    total: pageMeta.total ?? currentMeta.total,
+                    nextCursor: pageMeta.nextCursor))
+            } catch {
+                // Cancelled: keep the previous result, no banner.
+                guard !tab.cancellationRequested, !Self.isCancellation(error) else { return }
+                guard selectedConnectionID == connectionID, tab.activeRequestID == requestID else { return }
+                errorMessage = Self.redactedMessage(for: error)
+            }
+        }
+    }
+
+    // MARK: - BullMQ snapshots (Sync to local SQL)
+
+    /// Snapshot file bookkeeping; nil disables sync (tests without a store).
+    private let snapshotStore: BullmqSnapshotStore?
+    /// Session id → snapshot file, for removal-time deletion. Snapshot
+    /// sessions are never persisted (no manifest entry, no Keychain secret).
+    private var snapshotFiles: [UUID: URL] = [:]
+
+    private(set) var isBullmqSyncing = false
+    /// Jobs written so far by the running sync.
+    private(set) var bullmqSyncProgress = 0
+    private var bullmqSyncRequestID: UUID?
+
+    /// Sync is a read of Redis (a local SQLite file is written), so read-only
+    /// and demo BullMQ connections may sync. Fail closed on anything else.
+    var canSyncBullmqSnapshot: Bool {
+        guard let session = selectedSession,
+              session.profile.engine == .bullmq,
+              session.adapter is any SupportsBullmqSnapshot
+        else { return false }
+        return true
+    }
+
+    /// The sync targets: discovered queue (collection) nodes.
+    var bullmqSyncQueues: [String] {
+        objects.filter { $0.kind == .collection }.map(\.name)
+    }
+
+    /// Coalesces batch progress callbacks onto the main actor (the adapter's
+    /// batches can arrive in bursts; only the latest total matters).
+    private final class BullmqSyncProgressRelay: Sendable {
+        private let total = Mutex(0)
+        private let hopScheduled = Mutex(false)
+
+        func add(_ delta: Int, deliver: @escaping @MainActor @Sendable (Int) -> Void) {
+            total.withLock { $0 += delta }
+            let shouldSchedule = hopScheduled.withLock { scheduled -> Bool in
+                if scheduled { return false }
+                scheduled = true
+                return true
+            }
+            guard shouldSchedule else { return }
+            Task { @MainActor in
+                hopScheduled.withLock { $0 = false }
+                deliver(total.withLock { $0 })
+            }
+        }
+    }
+
+    /// Materializes every job of one queue into a local SQLite snapshot and
+    /// opens it as a new read-only session named
+    /// `Snapshot: <queue> (from <connection>)`. Full rebuild per sync (see
+    /// `BullmqSnapshotWriter` for why incremental would keep dirty rows): the
+    /// writer fills a `<file>.tmp`, which is renamed over the previous
+    /// snapshot only after a successful commit — the previous session is
+    /// closed first so its file handle never straddles the rename.
+    @discardableResult
+    func syncBullmqSnapshot(queue: String) async -> Bool {
+        guard !isBullmqSyncing,
+              let session = selectedSession,
+              session.profile.engine == .bullmq,
+              let adapter = session.adapter as? any SupportsBullmqSnapshot,
+              let snapshotStore
+        else {
+            errorMessage = "This connection does not support snapshots."
+            return false
+        }
+        let requestID = UUID()
+        bullmqSyncRequestID = requestID
+        isBullmqSyncing = true
+        bullmqSyncProgress = 0
+        defer {
+            isBullmqSyncing = false
+            bullmqSyncRequestID = nil
+        }
+
+        let finalURL = snapshotStore.snapshotFileURL(connectionID: session.id, queue: queue)
+        let temporaryURL = snapshotStore.temporaryFileURL(for: finalURL)
+        do {
+            try snapshotStore.prepareDirectory()
+            snapshotStore.deleteSnapshot(at: temporaryURL)
+            let writer = try BullmqSnapshotWriter(fileURL: temporaryURL)
+            let relay = BullmqSyncProgressRelay()
+            do {
+                _ = try await adapter.collectBullmqJobs(
+                    options: BullmqCollectOptions(queue: queue, requestID: requestID)) { batch in
+                    try writer.insertBatch(batch)
+                    relay.add(batch.count) { [weak self] total in
+                        self?.bullmqSyncProgress = total
+                    }
+                }
+                try writer.commit()
+            } catch {
+                writer.abort()
+                snapshotStore.deleteSnapshot(at: temporaryURL)
+                throw error
+            }
+
+            // Replace any previous snapshot session for this file before the
+            // rename, so its SQLite handle is closed first.
+            if let existing = snapshotFiles.first(where: { $0.value == finalURL })?.key {
+                removeConnection(existing)
+            }
+            let fileManager = FileManager.default
+            try? fileManager.removeItem(at: finalURL)
+            try fileManager.moveItem(at: temporaryURL, to: finalURL)
+
+            let snapshotAdapter = try SQLiteAdapter(input: .init(
+                name: "Snapshot: \(queue) (from \(session.profile.name))",
+                filePath: finalURL.path,
+                readOnly: true))
+            // Fail fast before registering: a snapshot that cannot be read is
+            // never shown as a session.
+            _ = try await snapshotAdapter.listObjects()
+            let snapshotSession = Session(profile: snapshotAdapter.profile, adapter: snapshotAdapter)
+            sessions.append(snapshotSession)
+            snapshotFiles[snapshotSession.id] = finalURL
+            selectConnection(snapshotSession.id)
+            return true
+        } catch {
+            if !Self.isCancellation(error) {
+                errorMessage = Self.redactedMessage(for: error)
+            }
+            return false
+        }
+    }
+
+    /// Best-effort cancellation of the running sync (the adapter checks the
+    /// flag between batches).
+    func cancelBullmqSync() {
+        guard let requestID = bullmqSyncRequestID, let session = selectedSession else { return }
+        Task { try? await session.adapter.cancel(requestID: requestID) }
+    }
+
+    /// App exit: snapshots are session-scoped, so every managed file goes.
+    func deleteAllSnapshots() {
+        try? snapshotStore?.sweepManagedFiles()
+    }
+
     // MARK: Query history
 
     /// Records a successfully executed query (matching the Electron reference,
@@ -1615,6 +1858,7 @@ final class SessionStore {
         switch command {
         case .sql: collection = nil
         case .mongoFind(let name, _), .mongoAggregate(let name, _): collection = name
+        case .bullmqJobs: collection = nil
         }
         do {
             try queryLibrary.record(

@@ -13,14 +13,31 @@ enum DemoError: dbbbbError {
 
 /// In-memory adapter that drives every UI path until the real engine adapters land.
 /// Actor-isolated, so it satisfies `DatabaseAdapter`'s `Sendable` requirement for free.
+///
+/// BullMQ demo sessions delegate to a real `BullmqAdapter` embedded over an
+/// in-memory Redis (`DemoRedisClient`), so paging, filters, logs, and
+/// snapshots exercise the production code path instead of canned shortcuts.
 actor DemoAdapter: DatabaseAdapter {
     nonisolated let profile: ConnectionProfile
     private let fixture: DemoFixture
     private var cancelledRequests: Set<UUID> = []
+    private let bullmqAdapter: BullmqAdapter?
+    private var bullmqConnected = false
 
     init(profile: ConnectionProfile, fixture: DemoFixture) {
         self.profile = profile
         self.fixture = fixture
+        if profile.engine == .bullmq {
+            // Fixed, known-valid demo input; the client is in-memory.
+            let client = DemoRedisClient.seeded()
+            self.bullmqAdapter = try! BullmqAdapter(
+                input: ConnectionInput.BullmqInput(
+                    name: profile.name, host: "demo", database: 0, prefix: "bull",
+                    environment: profile.environment, readOnly: profile.readOnly),
+                client: client, fetcher: BullmqJsPageFetcher(client: client))
+        } else {
+            self.bullmqAdapter = nil
+        }
     }
 
     /// A "new connection" in demo mode gets the canned dataset for its engine.
@@ -39,7 +56,7 @@ actor DemoAdapter: DatabaseAdapter {
         )
     }
 
-    /// The four seeded demo connections, one per engine.
+    /// The seeded demo connections, one per engine.
     static func demoSessions() -> [DemoAdapter] {
         [
             DemoAdapter(
@@ -66,10 +83,27 @@ actor DemoAdapter: DatabaseAdapter {
                     endpoint: "notes.db", database: "notes.db",
                     environment: .development, readOnly: false, demo: true),
                 fixture: .sqlite),
+            DemoAdapter(
+                profile: ConnectionProfile(
+                    name: "Local Queues (BullMQ)", engine: .bullmq,
+                    endpoint: "demo:6379", database: "0",
+                    environment: .development, readOnly: true, demo: true),
+                fixture: .empty),
         ]
     }
 
+    /// The embedded BullMQ adapter, connected once on first use.
+    private func bullmq() async throws -> BullmqAdapter? {
+        guard let bullmqAdapter else { return nil }
+        if !bullmqConnected {
+            try await bullmqAdapter.connect()
+            bullmqConnected = true
+        }
+        return bullmqAdapter
+    }
+
     func listObjects() async throws -> [DatabaseObject] {
+        if let bullmq = try await bullmq() { return try await bullmq.listObjects() }
         try await simulateLatency(milliseconds: 220)
         return fixture.objects
     }
@@ -80,6 +114,7 @@ actor DemoAdapter: DatabaseAdapter {
     /// (numbers numerically, strings lexically, NULLs low), and the page is
     /// sliced after both. `truncated` signals that a next page exists.
     func previewObject(_ request: PreviewRequest) async throws -> QueryResult {
+        if let bullmq = try await bullmq() { return try await bullmq.previewObject(request) }
         let start = ContinuousClock.now
         try await simulateLatency(milliseconds: 180, cancelling: request.requestID)
         let elapsed = milliseconds(since: start)
@@ -199,6 +234,11 @@ actor DemoAdapter: DatabaseAdapter {
     }
 
     func execute(_ command: DatabaseCommand, options: ExecuteOptions) async throws -> QueryResult {
+        if profile.engine == .bullmq {
+            guard case .bullmqJobs = command else { throw AdapterError.engineMismatch }
+            guard let bullmq = try await bullmq() else { throw AdapterError.engineMismatch }
+            return try await bullmq.execute(command, options: options)
+        }
         let start = ContinuousClock.now
         try await simulateLatency(milliseconds: 420, cancelling: options.requestID)
         let elapsed = milliseconds(since: start)
@@ -211,17 +251,22 @@ actor DemoAdapter: DatabaseAdapter {
             return try executeMongo(collection: collection, text: filter, options: options, elapsed: elapsed)
         case .mongoAggregate(let collection, let pipeline):
             return try executeMongo(collection: collection, text: pipeline, options: options, elapsed: elapsed)
-        case .sql: throw AdapterError.engineMismatch
+        case .sql, .bullmqJobs: throw AdapterError.engineMismatch
         }
     }
 
     func cancel(requestID: UUID) async throws {
+        if let bullmq = try await bullmq() {
+            try await bullmq.cancel(requestID: requestID)
+            return
+        }
         // SQLite has no server-side interruption; demo the unsupported path there.
         if profile.engine == .sqlite { throw AdapterError.cancellationUnsupported }
         cancelledRequests.insert(requestID)
     }
 
     func close() async {
+        if let bullmqAdapter { await bullmqAdapter.close() }
         cancelledRequests.removeAll()
     }
 
@@ -327,5 +372,18 @@ extension DemoAdapter: SupportsServerActivity {
     /// connection, and the session layer never offers kill for demo profiles.
     func killActivity(id: String) async throws {
         try await simulateLatency(milliseconds: 80)
+    }
+}
+
+// MARK: - Demo BullMQ snapshots (Sync to local SQL)
+
+extension DemoAdapter: SupportsBullmqSnapshot {
+    /// Delegates to the embedded BullMQ adapter; fail closed on other engines.
+    func collectBullmqJobs(
+        options: BullmqCollectOptions,
+        onBatch: @Sendable ([DisplayValue]) async throws -> Void
+    ) async throws -> Int {
+        guard let bullmq = try await bullmq() else { throw AdapterError.engineMismatch }
+        return try await bullmq.collectBullmqJobs(options: options, onBatch: onBatch)
     }
 }
