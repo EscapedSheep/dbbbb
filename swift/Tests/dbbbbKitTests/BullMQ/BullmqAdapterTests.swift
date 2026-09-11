@@ -92,6 +92,11 @@ struct BullmqAdapterTests {
         #expect(emailsStates.first { $0.id == "emails:paused" }?.detail == "0 jobs")
         #expect(emailsStates.first { $0.id == "emails:waiting-children" }?.detail == "0 jobs")
         #expect(nodes.first { $0.id == "ops:reports:failed" }?.detail == "1 job")
+        // Discovery asks the server for large SCAN pages (remote keyspaces
+        // are RTT-bound; see BullmqAdapter's scanCount comment). The fake
+        // still pages at 3, so multi-page traversal is covered regardless.
+        #expect(!fake.scanCounts.isEmpty)
+        #expect(fake.scanCounts.allSatisfy { $0 >= 10_000 })
         await adapter.close()
     }
 

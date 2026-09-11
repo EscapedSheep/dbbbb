@@ -302,7 +302,7 @@ final class SessionStore {
     /// survives a restart.
     func addConnection(_ input: ConnectionInput) async throws {
         let makeAdapter = self.makeAdapter
-        let adapter = try await probeWithTimeout {
+        let adapter = try await probeWithTimeout(engine: input.engine) {
             let adapter = try await makeAdapter(input)
             do {
                 _ = try await adapter.listObjects()
@@ -326,6 +326,16 @@ final class SessionStore {
 
     /// Per-instance so tests can shorten the budget without cross-test bleed.
     var connectProbeTimeout: Duration = .seconds(15)
+
+    /// BullMQ probes get a wider budget: queue discovery is SCAN over the
+    /// whole keyspace — O(keyspace / COUNT) round trips — so a slow remote
+    /// with tens of thousands of keys can legitimately need tens of seconds
+    /// even with the large scan COUNT. Other engines keep the tight budget.
+    static let bullmqProbeTimeout: Duration = .seconds(45)
+
+    private func probeTimeout(for engine: DatabaseEngine) -> Duration {
+        engine == .bullmq ? max(connectProbeTimeout, Self.bullmqProbeTimeout) : connectProbeTimeout
+    }
 
     /// Raised when the connect probe exceeds `connectProbeTimeout`. Pre-redacted.
     struct ConnectProbeTimeoutError: dbbbbError, Equatable {
@@ -352,12 +362,13 @@ final class SessionStore {
     /// indefinitely. Exactly one side resumes; a probe that finishes after the
     /// timeout is handed to `onAbandoned`.
     private func probeWithTimeout<T: Sendable>(
+        engine: DatabaseEngine,
         _ probe: @escaping @Sendable () async throws -> T,
         onAbandoned: (@Sendable (T) -> Void)? = nil
     ) async throws -> T {
         let probeTask = Task { try await probe() }
         let gate = ProbeResumeGate()
-        let timeout = connectProbeTimeout
+        let timeout = probeTimeout(for: engine)
         return try await withCheckedThrowingContinuation { continuation in
             Task {
                 let result = await probeTask.result
@@ -536,7 +547,7 @@ final class SessionStore {
         // settings have answered a real round trip.
         let newInput = resolved
         let makeAdapter = self.makeAdapter
-        let adapter = try await probeWithTimeout {
+        let adapter = try await probeWithTimeout(engine: newInput.engine) {
             let adapter = try await makeAdapter(newInput)
             do {
                 _ = try await adapter.listObjects()

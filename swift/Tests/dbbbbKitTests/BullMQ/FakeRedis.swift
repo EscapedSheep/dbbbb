@@ -59,8 +59,15 @@ final class FakeRedis: RedisClienting, @unchecked Sendable {
 
     func ping() async throws {}
 
+    /// Records the COUNT hints the adapter passes (queue discovery must use
+    /// a large COUNT — small values make remote scans RTT-bound).
+    private(set) var scanCounts: [Int] = []
+
     func scan(cursor: String, match: String, count: Int) async throws -> (nextCursor: String, keys: [String]) {
+        scanCounts.append(count)
         let all = keys.filter { BullmqGlobMatcher.matches(match, $0) }.sorted()
+        // Intentionally ignores `count` for paging: unit tests must keep
+        // exercising multi-page SCAN regardless of the production hint.
         let pageSize = 3
         let start = Int(cursor) ?? 0
         let page = Array(all[start...].prefix(pageSize))

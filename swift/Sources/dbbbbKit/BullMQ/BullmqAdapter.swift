@@ -41,7 +41,11 @@ public final class BullmqAdapter: DatabaseAdapter, Sendable {
 
     private static let filterBatchSize = 200
     private static let collectBatchSize = 500
-    private static let scanCount = 200
+    // COUNT is only a server-side hint: queue discovery is O(keyspace × RTT),
+    // so on a slow remote with tens of thousands of keys a small COUNT means
+    // hundreds of round trips (measured: ~290 RTTs ≈ 102 s at 350 ms RTT).
+    // 10 000 keeps even a large keyspace to a handful of round trips.
+    private static let scanCount = 10_000
     private static let defaultMaxBytes = 5 * 1024 * 1024
 
     public convenience init(input: ConnectionInput.BullmqInput) throws {
