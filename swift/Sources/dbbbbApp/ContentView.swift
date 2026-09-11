@@ -102,7 +102,11 @@ private struct AppHeaderView: View {
             .frame(width: 30, height: 30)
             .help("Appearance")
         }
-        .padding(.leading, 72) // traffic lights occupy ~70pt; hug them (hidden title bar)
+        // The hidden title bar's traffic lights occupy their own strip above
+        // the header (measured on macOS 26: dots row ends ~28pt above the
+        // header row), so no horizontal clearance is needed — a plain 10pt
+        // margin makes the toggle the true leftmost element.
+        .padding(.leading, 10)
         .padding(.trailing, 10)
         .frame(height: AppMetrics.headerHeight)
         .background(AppColors.bgPanel)
