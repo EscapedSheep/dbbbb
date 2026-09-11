@@ -172,23 +172,6 @@ struct SessionStoreEditConnectionTests {
         }
     }
 
-    @Test func unsavedSessionIsRefused() async throws {
-        let (store, connectionStore, _, directory) = makeStack()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let adapter = StubAdapter(engine: .postgresql)
-        let counter = Counter()
-        let id = try await addEditableSession(to: store, adapter: adapter, input: postgresInput(), factoryCount: counter)
-        // Simulate a session whose manifest entry vanished.
-        try connectionStore.remove(id: id)
-
-        await #expect(throws: AdapterError.self) {
-            try await store.updateConnection(id: id, input: postgresInput(name: "Unsaved"))
-        }
-        store.beginEditConnection(id)
-        #expect(store.editingConnection == nil)
-        #expect(store.errorMessage == "Only saved connections can be edited.")
-    }
-
     @Test func editorPrefillsTheCurrentInput() async throws {
         let (store, _, _, directory) = makeStack()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -207,5 +190,106 @@ struct SessionStoreEditConnectionTests {
         #expect(input.port == 5432)
         #expect(input.password == "old-secret")
         #expect(input.sslMode == .require)
+    }
+
+    @Test func unsavedSessionEditsFromTheInMemoryInput() async throws {
+        let (store, connectionStore, _, directory) = makeStack()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let adapter = StubAdapter(engine: .postgresql)
+        let counter = Counter()
+        let id = try await addEditableSession(to: store, adapter: adapter, input: postgresInput(), factoryCount: counter)
+        // Simulate a session whose manifest entry vanished (or was never saved).
+        try connectionStore.remove(id: id)
+
+        // The editor opens from the in-memory add-time input.
+        store.beginEditConnection(id)
+        let editing = try #require(store.editingConnection)
+        #expect(!editing.isPersisted)
+        guard case .postgres(let input) = editing.input else {
+            Issue.record("expected postgres input")
+            return
+        }
+        #expect(input.host == "db.internal")
+
+        // Metadata-only edit: in place, no reconnect, nothing persisted.
+        var edited = postgresInput(name: "Renamed Unsaved")
+        if case .postgres(var pg) = edited {
+            pg.environment = .staging
+            pg.password = ""
+            edited = .postgres(pg)
+        }
+        try await store.updateConnection(id: id, input: edited)
+        #expect(counter.value == 1)
+        #expect(store.sessions.first { $0.id == id }?.profile.name == "Renamed Unsaved")
+        #expect(store.sessions.first { $0.id == id }?.profile.environment == .staging)
+        #expect(connectionStore.loadConnections().isEmpty)
+    }
+
+    @Test func unsavedParameterChangeReconnectsWithoutPersisting() async throws {
+        let (store, connectionStore, keychain, directory) = makeStack()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let adapterA = StubAdapter(engine: .postgresql, name: "A")
+        let adapterB = StubAdapter(engine: .postgresql, name: "B")
+        let counter = Counter()
+        let id = try await addEditableSession(to: store, adapter: adapterA, input: postgresInput(), factoryCount: counter)
+        try connectionStore.remove(id: id)
+
+        store.makeAdapter = { _ in
+            counter.increment()
+            return adapterB
+        }
+        // Blank password on an unsaved session keeps the add-time password
+        // (the Keychain copy was deleted with the manifest entry).
+        try await store.updateConnection(id: id, input: postgresInput(port: 5444, password: ""))
+        #expect(store.sessions.first { $0.id == id }?.adapter as? StubAdapter === adapterB)
+        // Still session-only: nothing lands in the manifest or Keychain.
+        #expect(connectionStore.loadConnections().isEmpty)
+        #expect(try keychain.secret(for: id) == nil)
+    }
+
+    @Test func unsavedEditWithRememberPersists() async throws {
+        let (store, connectionStore, keychain, directory) = makeStack()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let adapterA = StubAdapter(engine: .postgresql, name: "A")
+        let adapterB = StubAdapter(engine: .postgresql, name: "B")
+        let counter = Counter()
+        let id = try await addEditableSession(to: store, adapter: adapterA, input: postgresInput(), factoryCount: counter)
+        try connectionStore.remove(id: id)
+
+        store.makeAdapter = { _ in
+            counter.increment()
+            return adapterB
+        }
+        var edited = postgresInput(name: "Saved Now", port: 5445, password: "")
+        if case .postgres(var pg) = edited {
+            pg.password = "fresh-secret"
+            edited = .postgres(pg)
+        }
+        try await store.updateConnection(id: id, input: edited, remember: true)
+
+        let record = try #require(connectionStore.loadConnections().first)
+        #expect(record.name == "Saved Now")
+        #expect(record.port == 5445)
+        #expect(try keychain.secret(for: id) == "fresh-secret")
+    }
+
+    @Test func unsavedFailedProbeKeepsSessionAndNothingPersisted() async throws {
+        let (store, connectionStore, keychain, directory) = makeStack()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let adapterA = StubAdapter(engine: .postgresql, name: "A")
+        let counter = Counter()
+        let id = try await addEditableSession(to: store, adapter: adapterA, input: postgresInput(), factoryCount: counter)
+        try connectionStore.remove(id: id)
+
+        store.makeAdapter = { _ in
+            counter.increment()
+            throw AdapterError.notFound("probe failed")
+        }
+        await #expect(throws: AdapterError.self) {
+            try await store.updateConnection(id: id, input: postgresInput(port: 5999), remember: true)
+        }
+        #expect(store.sessions.first { $0.id == id }?.adapter as? StubAdapter === adapterA)
+        #expect(connectionStore.loadConnections().isEmpty)
+        #expect(try keychain.secret(for: id) == nil)
     }
 }

@@ -68,6 +68,10 @@ final class SessionStore {
 
     private(set) var sessions: [Session] = []
     private(set) var selectedConnectionID: UUID?
+    /// The full input of sessions added this launch, in memory only — lets
+    /// unsaved (never-persisted) connections be edited without re-typing
+    /// parameters. Cleared on removal; never written to disk.
+    private var sessionInputs: [UUID: ConnectionInput] = [:]
     private(set) var objects: [DatabaseObject] = []
     /// The object the user last clicked or previewed; MongoDB queries run
     /// against it (the editor text is pure Extended JSON).
@@ -314,6 +318,7 @@ final class SessionStore {
         }
         let session = Session(profile: adapter.profile, adapter: adapter)
         sessions.append(session)
+        sessionInputs[session.id] = input
         selectConnection(session.id)
         // After selectConnection, which clears the error banner.
         persist(input, id: session.id)
@@ -394,25 +399,33 @@ final class SessionStore {
     struct ConnectionEditingContext: Identifiable, Sendable {
         let id: UUID
         let input: ConnectionInput
+        /// False for sessions that were never persisted (added this launch
+        /// with persistence off or failed); the sheet offers "Save this
+        /// connection" for them.
+        let isPersisted: Bool
     }
 
     /// Non-nil while the edit-connection sheet is shown.
     var editingConnection: ConnectionEditingContext?
 
-    /// Opens the edit sheet for a saved, non-demo connection. Fail closed:
-    /// demo sessions and sessions without a persisted record cannot be edited
-    /// (a session whose manifest entry vanished is a restore-time anomaly).
+    /// Opens the edit sheet for a non-demo connection: persisted connections
+    /// rebuild their input from the manifest + Keychain; unsaved sessions
+    /// (added this launch, never persisted) use the input tracked in memory.
+    /// Fail closed only for demo sessions and true anomalies.
     func beginEditConnection(_ id: UUID) {
         guard let session = sessions.first(where: { $0.id == id }),
               !session.profile.demo else { return }
-        guard let connectionStore,
-              let record = connectionStore.loadConnections().first(where: { $0.id == id }),
-              let input = try? record.makeInput(secret: try? connectionStore.secret(for: id))
-        else {
-            errorMessage = "Only saved connections can be edited."
+        if let connectionStore,
+           let record = connectionStore.loadConnections().first(where: { $0.id == id }),
+           let input = try? record.makeInput(secret: try? connectionStore.secret(for: id)) {
+            editingConnection = ConnectionEditingContext(id: id, input: input, isPersisted: true)
             return
         }
-        editingConnection = ConnectionEditingContext(id: id, input: input)
+        if let input = sessionInputs[id] {
+            editingConnection = ConnectionEditingContext(id: id, input: input, isPersisted: false)
+            return
+        }
+        errorMessage = "This connection cannot be edited."
     }
 
     /// Whether the proposed input changes anything that only a reconnect
@@ -442,14 +455,28 @@ final class SessionStore {
         }
     }
 
+    /// The current password of a host-based input (nil for engines without
+    /// one); used to resolve blank edit-form passwords on unsaved sessions.
+    private static func password(of input: ConnectionInput) -> String? {
+        switch input {
+        case .postgres(let i): i.password
+        case .mysql(let i): i.password
+        case .bullmq(let i): i.password
+        case .mongo, .sqlite: nil
+        }
+    }
+
     /// Saves an edited connection. Fail-closed semantics:
     /// - metadata-only edits (name/environment) update in place, no reconnect;
     /// - parameter/read-only changes probe the new settings with a real round
     ///   trip (same as add) and replace the session only on success — a failed
     ///   probe keeps the working session and the persisted record untouched;
     /// - the engine can never change through editing;
-    /// - a blank password field keeps the current Keychain secret.
-    func updateConnection(id: UUID, input proposed: ConnectionInput) async throws {
+    /// - a blank password field keeps the current secret (Keychain for saved
+    ///   connections, the in-memory add-time input for unsaved ones);
+    /// - unsaved sessions stay session-only unless `remember` is set, in
+    ///   which case they persist (manifest + Keychain) on a successful save.
+    func updateConnection(id: UUID, input proposed: ConnectionInput, remember: Bool = false) async throws {
         guard let index = sessions.firstIndex(where: { $0.id == id }),
               !sessions[index].profile.demo else {
             throw AdapterError.notFound("This connection cannot be edited.")
@@ -457,16 +484,25 @@ final class SessionStore {
         guard proposed.engine == sessions[index].profile.engine else {
             throw AdapterError.notFound("The connection's engine cannot be changed.")
         }
-        guard let connectionStore,
-              let record = connectionStore.loadConnections().first(where: { $0.id == id }),
-              let oldInput = try? record.makeInput(secret: try? connectionStore.secret(for: id))
-        else {
-            throw AdapterError.notFound("Only saved connections can be edited.")
+        let record = connectionStore?.loadConnections().first(where: { $0.id == id })
+        let oldInput: ConnectionInput
+        var existingSecret: String?
+        if let record {
+            guard let input = try? record.makeInput(secret: try? connectionStore?.secret(for: id))
+            else {
+                throw AdapterError.notFound("This connection cannot be edited.")
+            }
+            oldInput = input
+            existingSecret = try? connectionStore?.secret(for: id)
+        } else if let input = sessionInputs[id] {
+            oldInput = input
+            existingSecret = Self.password(of: input)
+        } else {
+            throw AdapterError.notFound("This connection cannot be edited.")
         }
 
         // Resolve blank passwords against the current secret before comparing
         // and before anything reaches the adapter factory.
-        let existingSecret = try? connectionStore.secret(for: id)
         var resolved = proposed
         switch resolved {
         case .postgres(var input) where input.password.isEmpty:
@@ -480,15 +516,19 @@ final class SessionStore {
         }
 
         guard Self.connectionAffectsSession(old: oldInput, new: resolved) else {
-            // Metadata only: update the manifest record and the live profile.
-            var updated = record
-            updated.name = resolved.name
-            updated.environment = resolved.environment
-            try connectionStore.save(updated, secret: nil)
+            // Metadata only: update the manifest record (when persisted) and
+            // the live profile / tracked input either way.
+            if let record, let connectionStore {
+                var updated = record
+                updated.name = resolved.name
+                updated.environment = resolved.environment
+                try connectionStore.save(updated, secret: nil)
+            }
             let old = sessions[index].profile
             sessions[index].profile = ConnectionProfile(
                 id: old.id, name: resolved.name, engine: old.engine, endpoint: old.endpoint,
                 database: old.database, environment: resolved.environment, readOnly: old.readOnly)
+            if sessionInputs[id] != nil { sessionInputs[id] = resolved }
             return
         }
 
@@ -514,12 +554,17 @@ final class SessionStore {
         let connected = adapter.profile
         sessions[index] = Session(
             profile: ConnectionProfile(
-                id: record.id, name: connected.name, engine: connected.engine,
+                id: id, name: connected.name, engine: connected.engine,
                 endpoint: connected.endpoint, database: connected.database,
                 environment: connected.environment, readOnly: connected.readOnly),
             adapter: adapter)
         Task { await old.adapter.close() }
-        persist(resolved, id: record.id)
+        sessionInputs[id] = resolved
+        // Persisted connections stay persisted; unsaved ones persist only
+        // when the user asked (the sheet's "Save this connection" toggle).
+        if record != nil || remember {
+            persist(resolved, id: id)
+        }
         // The object tree belongs to the old parameters; reload it.
         if selectedConnectionID == id { refreshObjects() }
     }
@@ -565,6 +610,7 @@ final class SessionStore {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         if selectedConnectionID == id { cancelInFlight() }
         let session = sessions.remove(at: index)
+        sessionInputs.removeValue(forKey: id)
         if selectedConnectionID == id {
             // Force reselection even if the first session coincides.
             selectedConnectionID = nil

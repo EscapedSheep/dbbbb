@@ -29,6 +29,8 @@ struct NewConnectionView: View {
     @State private var readOnly = false
     @State private var addError: String?
     @State private var isSubmitting = false
+    /// Edit mode on a never-persisted session: opt-in "Save this connection".
+    @State private var rememberConnection = false
 
     /// Add mode (nil) or edit mode with every field prefilled from the
     /// current input — except password fields, which start blank on purpose.
@@ -157,6 +159,12 @@ struct NewConnectionView: View {
                 }
 
                 Section("Options") {
+                    if let editing, !editing.isPersisted {
+                        Toggle("Save this connection", isOn: $rememberConnection)
+                        Text("Off: this edit stays session-only. On: the connection is stored with the protected OS credential storage.")
+                            .font(.caption)
+                            .foregroundStyle(AppColors.textDisabled)
+                    }
                     Picker("Environment", selection: $environment) {
                         ForEach(ConnectionEnvironment.allCases, id: \.self) { env in
                             Text(env.rawValue.capitalized).tag(env)
@@ -326,7 +334,7 @@ struct NewConnectionView: View {
             defer { isSubmitting = false }
             do {
                 if let editing {
-                    try await store.updateConnection(id: editing.id, input: input)
+                    try await store.updateConnection(id: editing.id, input: input, remember: rememberConnection)
                 } else {
                     try await store.addConnection(input)
                 }
