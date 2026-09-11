@@ -44,6 +44,7 @@ actor DemoAdapter: DatabaseAdapter {
     init(input: ConnectionInput) {
         self.init(
             profile: ConnectionProfile(
+                id: Self.demoID(for: input.engine),
                 name: input.name,
                 engine: input.engine,
                 endpoint: input.endpoint,
@@ -56,35 +57,54 @@ actor DemoAdapter: DatabaseAdapter {
         )
     }
 
+    /// Stable per-engine demo ids: "removed demo connection" preferences key
+    /// off these across launches. Demo ids were random per launch before the
+    /// removal preference existed, so nothing persisted can meaningfully
+    /// reference the old ones.
+    static func demoID(for engine: DatabaseEngine) -> UUID {
+        switch engine {
+        case .postgresql: UUID(uuidString: "00000000-0000-0000-0000-00000000de01")!
+        case .mongodb: UUID(uuidString: "00000000-0000-0000-0000-00000000de02")!
+        case .mysql: UUID(uuidString: "00000000-0000-0000-0000-00000000de03")!
+        case .sqlite: UUID(uuidString: "00000000-0000-0000-0000-00000000de04")!
+        case .bullmq: UUID(uuidString: "00000000-0000-0000-0000-00000000de05")!
+        }
+    }
+
     /// The seeded demo connections, one per engine.
     static func demoSessions() -> [DemoAdapter] {
         [
             DemoAdapter(
                 profile: ConnectionProfile(
+                    id: demoID(for: .postgresql),
                     name: "Warehouse (PG)", engine: .postgresql,
                     endpoint: "db.internal:5432", database: "warehouse",
                     environment: .production, readOnly: true, demo: true),
                 fixture: .postgres),
             DemoAdapter(
                 profile: ConnectionProfile(
+                    id: demoID(for: .mongodb),
                     name: "Events (Mongo)", engine: .mongodb,
                     endpoint: "mongodb://***/analytics", database: "analytics",
                     environment: .staging, readOnly: false, demo: true),
                 fixture: .mongo),
             DemoAdapter(
                 profile: ConnectionProfile(
+                    id: demoID(for: .mysql),
                     name: "Shop (MySQL)", engine: .mysql,
                     endpoint: "127.0.0.1:3306", database: "shop",
                     environment: .development, readOnly: false, demo: true),
                 fixture: .mysql),
             DemoAdapter(
                 profile: ConnectionProfile(
+                    id: demoID(for: .sqlite),
                     name: "Local Notes (SQLite)", engine: .sqlite,
                     endpoint: "notes.db", database: "notes.db",
                     environment: .development, readOnly: false, demo: true),
                 fixture: .sqlite),
             DemoAdapter(
                 profile: ConnectionProfile(
+                    id: demoID(for: .bullmq),
                     name: "Local Queues (BullMQ)", engine: .bullmq,
                     endpoint: "demo:6379", database: "0",
                     environment: .development, readOnly: true, demo: true),

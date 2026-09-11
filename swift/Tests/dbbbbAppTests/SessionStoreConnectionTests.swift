@@ -61,7 +61,7 @@ struct SessionStoreConnectionTests {
             secret: nil)
 
         let adapter = StubAdapter(name: "Zombie")
-        let store = SessionStore(connectionStore: connectionStore, queryLibrary: nil)
+        let store = SessionStore(connectionStore: connectionStore, queryLibrary: nil, defaults: makeIsolatedDefaults())
         store.makeAdapter = { _ in
             // The user deletes the connection while the restore is reconnecting.
             try? connectionStore.remove(id: zombieID)
@@ -84,7 +84,7 @@ struct SessionStoreConnectionTests {
             secret: nil)
 
         let adapter = StubAdapter(name: "Kept")
-        let store = SessionStore(connectionStore: connectionStore, queryLibrary: nil)
+        let store = SessionStore(connectionStore: connectionStore, queryLibrary: nil, defaults: makeIsolatedDefaults())
         store.makeAdapter = { _ in adapter }
 
         #expect(await waitUntil { store.sessions.contains { $0.id == keptID } })

@@ -14,7 +14,7 @@ struct SessionStoreEditConnectionTests {
             .appendingPathComponent("dbbbb-edit-test-\(UUID().uuidString)")
         let keychain = InMemoryKeychainStore()
         let connectionStore = ConnectionStore(directory: directory, keychain: keychain)
-        let store = SessionStore(connectionStore: connectionStore, queryLibrary: nil)
+        let store = SessionStore(connectionStore: connectionStore, queryLibrary: nil, defaults: makeIsolatedDefaults())
         return (store, connectionStore, keychain, directory)
     }
 

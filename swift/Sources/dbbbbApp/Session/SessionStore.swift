@@ -158,18 +158,33 @@ final class SessionStore {
         return false
     }
 
+    /// Preferences handle for the removed-demo set; tests inject an isolated
+    /// suite so they never touch the user's real defaults.
+    private let defaults: UserDefaults
+
+    /// UserDefaults key: ids of demo connections the user removed. Preference
+    /// class state (not a credential), so it lives here rather than in the
+    /// connection manifest.
+    static let removedDemoIDsKey = "removedDemoConnectionIDs"
+
     init(connectionStore: ConnectionStore? = ConnectionStore(),
          queryLibrary: QueryLibraryStore? = QueryLibraryStore(),
-         snapshotStore: BullmqSnapshotStore? = nil) {
+         snapshotStore: BullmqSnapshotStore? = nil,
+         defaults: UserDefaults = .standard) {
         self.connectionStore = connectionStore
         self.queryLibrary = queryLibrary
         self.snapshotStore = snapshotStore
+        self.defaults = defaults
         // Startup sweep: snapshots never outlive their session, so anything
         // left in the directory is a leftover from a previous run.
         if let snapshotStore { try? snapshotStore.sweepManagedFiles() }
         queryEntries = queryLibrary?.entries ?? []
         selectedTabID = tabs[0].id
-        sessions = DemoAdapter.demoSessions().map { Session(profile: $0.profile, adapter: $0) }
+        // Demo connections seed every launch except the ones the user removed.
+        let removedDemos = Set(defaults.stringArray(forKey: Self.removedDemoIDsKey) ?? [])
+        sessions = DemoAdapter.demoSessions()
+            .filter { !removedDemos.contains($0.profile.id.uuidString) }
+            .map { Session(profile: $0.profile, adapter: $0) }
         if let first = sessions.first { selectConnection(first.id) }
         restorePersistedConnections()
     }
@@ -561,10 +576,17 @@ final class SessionStore {
             selectConnection(sessions.first?.id)
         }
         // Snapshot sessions delete their backing file and never touch the
-        // manifest; demo connections never touch disk or the Keychain.
+        // manifest; demo connections never touch disk or the Keychain — their
+        // removal is a persisted preference so they stay removed next launch.
         if let file = snapshotFiles.removeValue(forKey: id) {
             snapshotStore?.deleteSnapshot(at: file)
-        } else if !session.profile.demo, let connectionStore {
+        } else if session.profile.demo {
+            var removed = defaults.stringArray(forKey: Self.removedDemoIDsKey) ?? []
+            if !removed.contains(id.uuidString) {
+                removed.append(id.uuidString)
+                defaults.set(removed, forKey: Self.removedDemoIDsKey)
+            }
+        } else if let connectionStore {
             do {
                 try connectionStore.remove(id: id)
             } catch {

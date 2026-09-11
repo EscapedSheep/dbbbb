@@ -245,7 +245,8 @@ struct SessionStoreBullmqTests {
             directory: directory.appendingPathComponent("connections"),
             keychain: InMemoryKeychainStore())
         let store = SessionStore(
-            connectionStore: connectionStore, queryLibrary: nil, snapshotStore: snapshotStore)
+            connectionStore: connectionStore, queryLibrary: nil, snapshotStore: snapshotStore,
+            defaults: makeIsolatedDefaults())
         return (store, snapshotStore, connectionStore, directory)
     }
 
@@ -357,7 +358,7 @@ struct SessionStoreBullmqTests {
         try Data("x".utf8).write(to: orphan)
         try Data("x".utf8).write(to: foreign)
 
-        _ = SessionStore(connectionStore: nil, queryLibrary: nil, snapshotStore: snapshotStore)
+        _ = SessionStore(connectionStore: nil, queryLibrary: nil, snapshotStore: snapshotStore, defaults: makeIsolatedDefaults())
         #expect(!FileManager.default.fileExists(atPath: orphan.path))
         #expect(FileManager.default.fileExists(atPath: foreign.path))
     }
@@ -403,7 +404,8 @@ struct SessionStoreBullmqTests {
         let store = SessionStore(
             connectionStore: nil, queryLibrary: nil,
             snapshotStore: BullmqSnapshotStore(
-                directory: directory.appendingPathComponent("bullmq-snapshots")))
+                directory: directory.appendingPathComponent("bullmq-snapshots")),
+            defaults: makeIsolatedDefaults())
         let demo = try #require(store.sessions.first { $0.profile.engine == .bullmq })
         #expect(demo.profile.name == "Local Queues (BullMQ)")
         #expect(demo.adapter is any SupportsBullmqSnapshot)

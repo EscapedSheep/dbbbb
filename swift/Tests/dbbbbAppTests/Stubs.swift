@@ -261,9 +261,18 @@ final class SchemaStubAdapter: StubAdapter, SupportsSchemaIntrospection, @unchec
     }
 }
 
+/// Isolated UserDefaults suite per call: tests removing demo connections
+/// write the removed-demo preference, which must never reach real defaults.
+func makeIsolatedDefaults() -> UserDefaults {
+    let suite = "dbbbb-test-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    return defaults
+}
+
 @MainActor
 func makeStore() -> SessionStore {
-    SessionStore(connectionStore: nil, queryLibrary: nil)
+    SessionStore(connectionStore: nil, queryLibrary: nil, defaults: makeIsolatedDefaults())
 }
 
 @MainActor
