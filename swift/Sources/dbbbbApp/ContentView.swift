@@ -36,6 +36,9 @@ struct ContentView: View {
         .sheet(isPresented: $store.showingNewConnection) {
             NewConnectionView()
         }
+        .sheet(item: $store.editingConnection) { editing in
+            NewConnectionView(editing: editing)
+        }
     }
 }
 

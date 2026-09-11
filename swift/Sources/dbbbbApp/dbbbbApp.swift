@@ -19,17 +19,21 @@ struct dbbbbApp: App {
                 .onAppear {
                     // CLI launches (swift run / .build/debug) start unfocused;
                     // come forward like a LaunchServices-launched app would.
-                    // moveToActiveSpace lets the window hop to the user's
-                    // current space instead of requiring a space switch.
-                    // Debug affordance: DBBBB_ALL_SPACES pins the window to
+                    // The window may not exist yet at first onAppear, so retry
+                    // for a moment: moveToActiveSpace lets the window hop to
+                    // the user's current space instead of requiring a space
+                    // switch. Debug affordance: DBBBB_ALL_SPACES pins it to
                     // every space instead (the two flags are exclusive), so
                     // headless screenshot runs can always capture it.
-                    if ProcessInfo.processInfo.environment["DBBBB_ALL_SPACES"] != nil {
-                        NSApp.windows.first?.collectionBehavior.insert(.canJoinAllSpaces)
-                    } else {
-                        NSApp.windows.first?.collectionBehavior.insert(.moveToActiveSpace)
+                    let allSpaces = ProcessInfo.processInfo.environment["DBBBB_ALL_SPACES"] != nil
+                    for delay in [0.0, 0.3, 0.8] {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            for window in NSApp.windows {
+                                window.collectionBehavior.insert(allSpaces ? .canJoinAllSpaces : .moveToActiveSpace)
+                            }
+                            NSApp.activate(ignoringOtherApps: true)
+                        }
                     }
-                    NSApp.activate(ignoringOtherApps: true)
                 }
         }
         .windowStyle(.hiddenTitleBar)

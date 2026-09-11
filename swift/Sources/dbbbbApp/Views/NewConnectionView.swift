@@ -8,6 +8,10 @@ struct NewConnectionView: View {
     @Environment(SessionStore.self) private var store
     @Environment(\.dismiss) private var dismiss
 
+    /// Edit mode: the connection being edited. The engine is fixed; password
+    /// fields start blank (blank = keep the current one).
+    private let editing: SessionStore.ConnectionEditingContext?
+
     @State private var engine: DatabaseEngine = .postgresql
     @State private var name = ""
     @State private var host = "localhost"
@@ -26,24 +30,80 @@ struct NewConnectionView: View {
     @State private var addError: String?
     @State private var isSubmitting = false
 
+    /// Add mode (nil) or edit mode with every field prefilled from the
+    /// current input — except password fields, which start blank on purpose.
+    init(editing: SessionStore.ConnectionEditingContext? = nil) {
+        self.editing = editing
+        guard let input = editing?.input else { return }
+        _engine = State(initialValue: input.engine)
+        _environment = State(initialValue: input.environment)
+        _readOnly = State(initialValue: input.readOnly)
+        switch input {
+        case .postgres(let i):
+            _name = State(initialValue: i.name)
+            _host = State(initialValue: i.host)
+            _port = State(initialValue: String(i.port))
+            _username = State(initialValue: i.username)
+            _database = State(initialValue: i.database)
+            _sslMode = State(initialValue: i.sslMode)
+        case .mysql(let i):
+            _name = State(initialValue: i.name)
+            _host = State(initialValue: i.host)
+            _port = State(initialValue: String(i.port))
+            _username = State(initialValue: i.username)
+            _database = State(initialValue: i.database)
+            _sslMode = State(initialValue: i.sslMode)
+        case .mongo(let i):
+            _name = State(initialValue: i.name)
+            _mongoURI = State(initialValue: i.uri)
+            _database = State(initialValue: i.database)
+            _mongoTLS = State(initialValue: i.tls)
+        case .sqlite(let i):
+            _name = State(initialValue: i.name)
+            _sqlitePath = State(initialValue: i.filePath)
+        case .bullmq(let i):
+            _name = State(initialValue: i.name)
+            _host = State(initialValue: i.host)
+            _port = State(initialValue: String(i.port))
+            _database = State(initialValue: String(i.database))
+            _bullPrefix = State(initialValue: i.prefix)
+            _bullTLS = State(initialValue: i.tls)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                // Engine cards, two per row (reference `.engine-picker`).
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                    ForEach(DatabaseEngine.allCases, id: \.self) { candidate in
-                        EngineOptionCard(engine: candidate, isSelected: candidate == engine) {
-                            engine = candidate
-                            switch candidate {
-                            case .mysql: port = "3306"
-                            case .bullmq: port = "6379"
-                            default: port = "5432"
+                if editing != nil {
+                    // Editing never changes the engine — show it as a fixed card.
+                    HStack(spacing: 10) {
+                        EngineBadge(engine: engine)
+                        Text(engine.displayName)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(AppColors.text)
+                        Spacer(minLength: 0)
+                        Text("Engine can't be changed")
+                            .font(.system(size: 11))
+                            .foregroundStyle(AppColors.textDisabled)
+                    }
+                    .padding(.vertical, 4)
+                } else {
+                    // Engine cards, two per row (reference `.engine-picker`).
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                        ForEach(DatabaseEngine.allCases, id: \.self) { candidate in
+                            EngineOptionCard(engine: candidate, isSelected: candidate == engine) {
+                                engine = candidate
+                                switch candidate {
+                                case .mysql: port = "3306"
+                                case .bullmq: port = "6379"
+                                default: port = "5432"
+                                }
+                                addError = nil
                             }
-                            addError = nil
                         }
                     }
+                    .padding(.vertical, 4)
                 }
-                .padding(.vertical, 4)
 
                 Section("Connection") {
                     TextField("Name", text: $name, prompt: Text(engine.displayName))
@@ -52,7 +112,13 @@ struct NewConnectionView: View {
                         TextField("Host", text: $host)
                         TextField("Port", text: $port)
                         TextField("Username", text: $username)
-                        SecureField("Password", text: $password)
+                        SecureField("Password", text: $password,
+                                    prompt: Text(editing == nil ? "" : "Leave blank to keep the current password"))
+                        if editing != nil {
+                            Text("Leave blank to keep the current password.")
+                                .font(.caption)
+                                .foregroundStyle(AppColors.textDisabled)
+                        }
                         // Optional for both: PostgreSQL falls back to the
                         // `postgres` maintenance database; MySQL connects
                         // without a default schema and browses server-wide.
@@ -77,7 +143,13 @@ struct NewConnectionView: View {
                     case .bullmq:
                         TextField("Host", text: $host)
                         TextField("Port", text: $port)
-                        SecureField("Password", text: $password, prompt: Text("Optional — Redis AUTH"))
+                        SecureField("Password", text: $password, prompt: Text(
+                            editing == nil ? "Optional — Redis AUTH" : "Leave blank to keep the current password"))
+                        if editing != nil {
+                            Text("Leave blank to keep the current password.")
+                                .font(.caption)
+                                .foregroundStyle(AppColors.textDisabled)
+                        }
                         TextField("Database", text: $database, prompt: Text("0–15"))
                         TextField("Key Prefix", text: $bullPrefix, prompt: Text("bull"))
                         Toggle("TLS", isOn: $bullTLS)
@@ -134,7 +206,7 @@ struct NewConnectionView: View {
                 Button("Cancel") { dismiss() }
                     .buttonStyle(.appSecondary)
                     .keyboardShortcut(.cancelAction)
-                Button("Add Connection") { submit() }
+                Button(editing == nil ? "Add Connection" : "Save Changes") { submit() }
                     .buttonStyle(.appPrimary)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!issues.isEmpty || isSubmitting)
@@ -253,7 +325,11 @@ struct NewConnectionView: View {
         Task { @MainActor in
             defer { isSubmitting = false }
             do {
-                try await store.addConnection(input)
+                if let editing {
+                    try await store.updateConnection(id: editing.id, input: input)
+                } else {
+                    try await store.addConnection(input)
+                }
                 dismiss()
             } catch {
                 addError = SessionStore.redactedMessage(for: error)

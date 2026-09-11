@@ -44,6 +44,13 @@ struct ConnectionsColumnView: View {
                                 isSelected: session.id == store.selectedConnectionID)
                             .onTapGesture { store.selectConnection(session.id) }
                             .contextMenu {
+                                // Editing is fail-closed: demo connections
+                                // never offer it (their input lives nowhere).
+                                if !session.profile.demo {
+                                    Button("Edit…") {
+                                        store.beginEditConnection(session.id)
+                                    }
+                                }
                                 Button("Remove Connection…", role: .destructive) {
                                     pendingRemoval = session.id
                                 }
