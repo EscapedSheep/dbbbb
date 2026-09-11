@@ -545,6 +545,29 @@ struct BullmqAdapterIntegrationTests {
         }
     }
 
+    /// Regression: the app factory only constructs the adapter (no explicit
+    /// connect); the first public operation must lazily connect.
+    @Test(.enabled(if: BullmqAdapterIntegrationTests.redisURL != nil))
+    func worksWithoutExplicitConnect() async throws {
+        try await Self.run(seed: Self.seedAll) { _ in
+            let (host, port) = try Self.hostPort()
+            let adapter = try BullmqAdapter(input: ConnectionInput.BullmqInput(
+                name: "lazy", host: host, port: port,
+                database: Self.redisDB, prefix: Self.prefix, readOnly: true))
+            // No connect() call at all.
+            let nodes = try await adapter.listObjects()
+            #expect(nodes.contains { $0.id == Self.queue })
+            let result = try await Self.executeJobs(
+                adapter, #"{"queue":"it-emails","state":"failed","limit":1}"#)
+            #expect(result.documents.count == 1)
+            await adapter.close()
+            // After close the adapter stays fail-closed (no resurrection).
+            await #expect(throws: BullmqAdapterError.closed) {
+                _ = try await adapter.listObjects()
+            }
+        }
+    }
+
     /// The default (Lua) fetcher — used by every other test here — and the JS
     /// fetcher must agree page for page.
     @Test(.enabled(if: BullmqAdapterIntegrationTests.redisURL != nil))

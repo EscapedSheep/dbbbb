@@ -58,11 +58,17 @@ final class SessionStore {
     /// are seeded at launch with `DemoAdapter` and never go through this factory.
     var makeAdapter: @Sendable (ConnectionInput) async throws -> any DatabaseAdapter = { input in
         switch input {
-        case .postgres(let input): try PostgresAdapter(input: input)
-        case .mysql(let input): try MySQLAdapter(input: input)
-        case .mongo(let input): try await MongoAdapter(input: input)
-        case .sqlite(let input): try SQLiteAdapter(input: input)
-        case .bullmq(let input): try BullmqAdapter(input: input)
+        case .postgres(let input): return try PostgresAdapter(input: input)
+        case .mysql(let input): return try MySQLAdapter(input: input)
+        case .mongo(let input): return try await MongoAdapter(input: input)
+        case .sqlite(let input): return try SQLiteAdapter(input: input)
+        case .bullmq(let input):
+            // BullMQ connects eagerly at add time (the probe documents a
+            // server round trip before the session exists); the adapter's
+            // lazy ensureConnected is the safety net underneath.
+            let adapter = try BullmqAdapter(input: input)
+            try await adapter.connect()
+            return adapter
         }
     }
 

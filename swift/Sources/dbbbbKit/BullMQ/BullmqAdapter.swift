@@ -31,6 +31,7 @@ public final class BullmqAdapter: DatabaseAdapter, Sendable {
 
     private struct State {
         var closed = false
+        var connected = false
         var knownQueues: Set<String> = []
         var activeRequestIDs: Set<UUID> = []
         var cancelledRequestIDs: Set<UUID> = []
@@ -81,8 +82,11 @@ public final class BullmqAdapter: DatabaseAdapter, Sendable {
 
     // MARK: - DatabaseAdapter
 
+    /// Explicit connect, idempotent. Kept public for callers that want the
+    /// round trip up front (SessionStore probes with it at add time).
     public func connect() async throws {
         try assertOpen()
+        if state.withLock({ $0.connected }) { return }
         do {
             try await client.connect()
             try await client.ping()
@@ -90,12 +94,28 @@ public final class BullmqAdapter: DatabaseAdapter, Sendable {
             await client.disconnect()
             throw BullmqErrorMapper.map(error)
         }
+        state.withLock { $0.connected = true }
+    }
+
+    /// The sibling adapters' lazy pattern (PostgreSQL connects on first
+    /// query, MongoDB in its async init): every public operation connects on
+    /// first use, so factory-constructed adapters work without an explicit
+    /// connect. `close()` still fails closed — a closed adapter never
+    /// resurrects itself.
+    ///
+    /// A concurrent first use may enter `client.connect()` twice;
+    /// `RedisConnection.connect` guards on `channel == nil`, so the loser
+    /// returns immediately and harmlessly.
+    private func ensureConnected() async throws {
+        try assertOpen()
+        if state.withLock({ $0.connected }) { return }
+        try await connect()
     }
 
     /// Queues as collection nodes plus one state node per queue (all eight
     /// states, even empty ones), with the live job count as the detail.
     public func listObjects() async throws -> [DatabaseObject] {
-        try assertOpen()
+        try await ensureConnected()
         do {
             let queues = try await discoverQueues()
             state.withLock { $0.knownQueues = Set(queues) }
@@ -124,7 +144,7 @@ public final class BullmqAdapter: DatabaseAdapter, Sendable {
     /// preview page offset maps onto the query's cursor — both are offsets
     /// into the state index, so the preview pager pages the index exactly.
     public func previewObject(_ request: PreviewRequest) async throws -> QueryResult {
-        try assertOpen()
+        try await ensureConnected()
         let knownQueues = state.withLock { $0.knownQueues }
         guard let resolved = BullmqDocumentMapper.resolveObjectID(knownQueues, objectID: request.object.id) else {
             throw BullmqAdapterError.unknownObject
@@ -144,7 +164,7 @@ public final class BullmqAdapter: DatabaseAdapter, Sendable {
     }
 
     public func execute(_ command: DatabaseCommand, options: ExecuteOptions) async throws -> QueryResult {
-        try assertOpen()
+        try await ensureConnected()
         guard case .bullmqJobs(let text) = command else {
             throw BullmqAdapterError.commandRejected
         }
@@ -219,7 +239,7 @@ public final class BullmqAdapter: DatabaseAdapter, Sendable {
         options: BullmqCollectOptions,
         onBatch: @Sendable ([DisplayValue]) async throws -> Void
     ) async throws -> Int {
-        try assertOpen()
+        try await ensureConnected()
         guard !options.queue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               options.queue.count <= 512 else {
             throw BullmqAdapterError.invalidQuery("BullMQ snapshot queue is invalid.")

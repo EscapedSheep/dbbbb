@@ -62,6 +62,32 @@ struct BullmqAdapterTests {
         await adapter.close()
     }
 
+    @Test func lazilyConnectsOnFirstUseWithoutExplicitConnect() async throws {
+        // The sibling adapters' lazy pattern: a factory-built adapter works
+        // without an explicit connect() (regression: the app factory only
+        // constructed, so the first command hit RedisError.closed).
+        let fake = FakeRedis()
+        fake.seedQueue("emails", jobs: [F.failedJob("1", 100)])
+        let adapter = try F.makeAdapter(fake)
+        let nodes = try await adapter.listObjects()
+        #expect(nodes.contains { $0.id == "emails" })
+
+        let result = try await F.executeJobs(adapter, #"{"queue":"emails","state":"failed"}"#)
+        #expect(F.ids(result.documents) == ["1"])
+        await adapter.close()
+    }
+
+    @Test func connectIsIdempotent() async throws {
+        let fake = FakeRedis()
+        let adapter = try F.makeAdapter(fake)
+        try await adapter.connect()
+        try await adapter.connect()
+        #expect(!fake.disconnected)
+        let nodes = try await adapter.listObjects()
+        #expect(nodes.isEmpty)
+        await adapter.close()
+    }
+
     // MARK: Object introspection
 
     @Test func discoversQueuesThroughPagedScanAndReportsPerStateCounts() async throws {
