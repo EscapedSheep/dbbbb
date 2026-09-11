@@ -82,6 +82,7 @@ struct ObjectsColumnView: View {
                     .controlSize(.small)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 18)
+                    .frame(maxHeight: .infinity, alignment: .top)
             } else if store.objects.isEmpty {
                 SidebarPlaceholder(text: "This database has no visible objects.")
             } else if !searchText.isEmpty && filteredTree.isEmpty {
@@ -126,9 +127,14 @@ struct ObjectsColumnView: View {
         }
     }
 
-    /// Collapsed-state header: current connection + expand affordance.
+    /// Collapsed-state header: disclosure-style — chevron at the left edge,
+    /// then engine badge and name; the whole strip is the expand affordance.
     private var collapsedConnectionStrip: some View {
         HStack(spacing: 8) {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(AppColors.textDisabled)
+                .frame(width: 14)
             if let profile = store.selectedSession?.profile {
                 EngineBadge(engine: profile.engine)
                 Text(profile.name)
@@ -141,19 +147,16 @@ struct ObjectsColumnView: View {
                     .foregroundStyle(AppColors.textDisabled)
             }
             Spacer(minLength: 0)
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    connectionsCollapsed = false
-                }
-            } label: {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-            }
-            .buttonStyle(AppIconButtonStyle(size: 22))
-            .help("Show the connections column (⌃⌘S)")
         }
         .padding(.horizontal, 8)
         .frame(height: 42)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                connectionsCollapsed = false
+            }
+        }
+        .help("Show the connections column (⌃⌘S)")
         .overlay(alignment: .bottom) {
             Rectangle().fill(AppColors.border).frame(height: 1)
         }

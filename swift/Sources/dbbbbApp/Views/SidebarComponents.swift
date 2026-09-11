@@ -34,6 +34,9 @@ struct SidebarPlaceholder: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 18)
             .padding(.horizontal, 10)
+            // Fill the column but hug the top (centering only made sense in
+            // the old single merged column).
+            .frame(maxHeight: .infinity, alignment: .top)
     }
 }
 
