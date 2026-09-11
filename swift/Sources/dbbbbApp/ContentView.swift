@@ -1,18 +1,29 @@
 import SwiftUI
 
-/// The Electron-style shell: a 44px header (wordmark + connection breadcrumb +
-/// window actions), a single-column sidebar (connections + objects), the
-/// workspace, and a 24px status bar across the bottom.
+/// The Electron-style shell: a 44px header (sidebar toggle + wordmark +
+/// connection breadcrumb + window actions), then the connections column
+/// (collapsible, animated), the objects column, and the workspace, with a
+/// 24px status bar across the bottom.
 struct ContentView: View {
     @Environment(SessionStore.self) private var store
     @AppStorage("appearance") private var appearance: AppAppearance = .system
+    /// Persisted collapse state of the connections column (⌃⌘S toggles).
+    @AppStorage("connectionsColumnCollapsed") private var connectionsCollapsed = false
+    /// Sidebar search text, shared by both columns (connections + objects).
+    @State private var sidebarSearch = ""
 
     var body: some View {
         @Bindable var store = store
         VStack(spacing: 0) {
-            AppHeaderView()
+            AppHeaderView(connectionsCollapsed: $connectionsCollapsed)
             HStack(spacing: 0) {
-                SidebarView()
+                if !connectionsCollapsed {
+                    ConnectionsColumnView(searchText: $sidebarSearch)
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                }
+                ObjectsColumnView(
+                    searchText: $sidebarSearch,
+                    connectionsCollapsed: $connectionsCollapsed)
                 QueryWorkspaceView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -28,14 +39,28 @@ struct ContentView: View {
     }
 }
 
-/// The top bar: wordmark, breadcrumb of the selected connection, and the
-/// window-level actions (appearance, new connection).
+/// The top bar: sidebar toggle, wordmark, breadcrumb of the selected
+/// connection, and the window-level actions (appearance, new connection).
 private struct AppHeaderView: View {
     @Environment(SessionStore.self) private var store
     @AppStorage("appearance") private var appearance: AppAppearance = .system
+    @Binding var connectionsCollapsed: Bool
 
     var body: some View {
         HStack(spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    connectionsCollapsed.toggle()
+                }
+            } label: {
+                Image(systemName: "sidebar.left")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.appIcon)
+            .keyboardShortcut("s", modifiers: [.control, .command])
+            .help(connectionsCollapsed
+                  ? "Show the connections column (⌃⌘S)"
+                  : "Hide the connections column (⌃⌘S)")
             Wordmark()
             Rectangle()
                 .fill(AppColors.border)

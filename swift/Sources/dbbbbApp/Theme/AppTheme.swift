@@ -78,6 +78,8 @@ enum AppMetrics {
     static let cornerRadius: CGFloat = 4
     static let badgeRadius: CGFloat = 999
     static let headerHeight: CGFloat = 44
+    /// The connections and objects columns each take this fixed width.
+    static let columnWidth: CGFloat = 240
     static let sidebarWidth: CGFloat = 268
     static let statusBarHeight: CGFloat = 24
     static let tabStripHeight: CGFloat = 36
