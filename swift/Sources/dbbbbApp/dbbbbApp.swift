@@ -16,7 +16,21 @@ struct dbbbbApp: App {
                 }
                 // CLI launches (swift run / .build/debug) start unfocused;
                 // come forward like a LaunchServices-launched app would.
-                .onAppear { NSApp.activate(ignoringOtherApps: true) }
+                .onAppear {
+                    // CLI launches (swift run / .build/debug) start unfocused;
+                    // come forward like a LaunchServices-launched app would.
+                    // moveToActiveSpace lets the window hop to the user's
+                    // current space instead of requiring a space switch.
+                    // Debug affordance: DBBBB_ALL_SPACES pins the window to
+                    // every space instead (the two flags are exclusive), so
+                    // headless screenshot runs can always capture it.
+                    if ProcessInfo.processInfo.environment["DBBBB_ALL_SPACES"] != nil {
+                        NSApp.windows.first?.collectionBehavior.insert(.canJoinAllSpaces)
+                    } else {
+                        NSApp.windows.first?.collectionBehavior.insert(.moveToActiveSpace)
+                    }
+                    NSApp.activate(ignoringOtherApps: true)
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1240, height: 780)

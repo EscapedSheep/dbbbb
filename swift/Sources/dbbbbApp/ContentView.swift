@@ -102,7 +102,7 @@ private struct AppHeaderView: View {
             .frame(width: 30, height: 30)
             .help("Appearance")
         }
-        .padding(.leading, 78) // clear the traffic lights (hidden title bar)
+        .padding(.leading, 72) // traffic lights occupy ~70pt; hug them (hidden title bar)
         .padding(.trailing, 10)
         .frame(height: AppMetrics.headerHeight)
         .background(AppColors.bgPanel)
